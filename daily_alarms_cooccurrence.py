@@ -342,13 +342,13 @@ def analyze_alarm_correlations(days_back=14):
                 'event': source.get('event', 'unknown'),
                 'category': source.get('category', 'unknown'),
                 'subcategory': source.get('subcategory', 'unknown'),
-                # Handle both regular sites and netsites
-                'src_site': source_data.get('src_site') or source_data.get('src_netsite'),
-                'dest_site': source_data.get('dest_site') or source_data.get('dest_netsite'),
-                'site': source_data.get('site'),
-                # Multi-site fields
-                'src_sites': source_data.get('src_sites'),
-                'dest_sites': source_data.get('dest_sites'),
+                # Handle both regular sites and netsites - CONVERT TO UPPERCASE
+                'src_site': (source_data.get('src_site') or source_data.get('src_netsite', '')).upper() if (source_data.get('src_site') or source_data.get('src_netsite')) else None,
+                'dest_site': (source_data.get('dest_site') or source_data.get('dest_netsite', '')).upper() if (source_data.get('dest_site') or source_data.get('dest_netsite')) else None,
+                'site': (source_data.get('site', '')).upper() if source_data.get('site') else None,
+                # Multi-site fields - CONVERT TO UPPERCASE
+                'src_sites': [s.upper() for s in source_data.get('src_sites', []) if s] if source_data.get('src_sites') else None,
+                'dest_sites': [s.upper() for s in source_data.get('dest_sites', []) if s] if source_data.get('dest_sites') else None,
                 # Other fields
                 'body': source.get('body', ''),
                 'alarm_id': source_data.get('alarm_id'),
@@ -726,7 +726,7 @@ def corr_analysis(analysis_results, unify_direction=False, pad_minutes=60):
             print(f"  • {day['date']}: R={day['R']:.3f}, {day['pairs_with_both']} pairs, {day['asn_alarms']} ASN + {day['perf_alarms']} perf alarms")
 
     #  PLOTS 
-    fig, axes = plt.subplots(3, 3, figsize=(24, 20))
+    fig, axes = plt.subplots(3, 3, figsize=(30, 30))
     fig.suptitle(' Alarm Analysis - Daily Variety Tracking', fontsize=16, y=0.98)
 
     # 1) Complexity score timeline
@@ -758,7 +758,7 @@ def corr_analysis(analysis_results, unify_direction=False, pad_minutes=60):
     ax.set_title('Daily ASN vs Performance Alarms'); ax.set_ylabel('Alarm Count')
     ax.set_xlabel('Date'); plt.setp(ax.get_xticklabels(), rotation=45, ha='right', fontsize=7); ax.legend()
 
-    # 4) Correlation Timeline - NEW PLOT
+    # 4) Correlation Timeline
     ax = axes[1,0]
     # Primary axis: R values (correlation strength)
     ax.plot(dates_str, daily_df['R'], 'o-', linewidth=2, markersize=5, color='purple', alpha=0.8, label='Correlation Strength (R)')
@@ -906,7 +906,7 @@ def same_day_pair_overlap_exact(day_df, unify_direction=False):
     return pairs_df, summary
 
 
-def plot_correlation_heatmaps(alarms_df, target_date, figsize=(20, 8)):
+def plot_correlation_heatmaps(alarms_df, target_date, figsize=(20, 30)):
     """
     Create site and country correlation heatmaps for a specific day.
     
@@ -933,10 +933,52 @@ def plot_correlation_heatmaps(alarms_df, target_date, figsize=(20, 8)):
         print(f"⚠️ No site pairs found for {target_date}")
         return None, None
     
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=figsize)
-    fig.suptitle(f'Correlation Heatmaps for {target_date}', fontsize=16, y=0.98)
+    fig, axes = plt.subplots(4, 2, figsize=(figsize[0], figsize[1]*1.2))
+    fig.suptitle(f'Correlation Analysis for {target_date}', fontsize=18, y=0.98)
     
-    # === SITE PAIR HEATMAP (BINARY) ===
+    # Flatten axes for easier indexing
+    ax_flat = axes.flatten()
+    ax1, ax2 = ax_flat[0], ax_flat[1]  # Keep original references
+    
+    # Helper function to categorize alarm types
+    def categorize_alarm(event):
+        event_lower = str(event).lower()
+        if 'asn' in event_lower or 'path' in event_lower:
+            return 'asn'
+        elif 'delay' in event_lower or 'owd' in event_lower:
+            return 'delay'
+        elif 'loss' in event_lower or 'packet' in event_lower:
+            return 'loss'
+        elif 'bandwidth' in event_lower or 'throughput' in event_lower:
+            return 'throughput'
+        else:
+            return 'other'
+    
+    # Add alarm categories to day_alarms
+    day_alarms['alarm_category'] = day_alarms['event'].apply(categorize_alarm)
+    
+    # Function to get specific correlation pairs
+    def get_specific_correlations(df, cat1, cat2):
+        df_clean = df.dropna(subset=['src_site','dest_site']).copy()
+        df_clean['alarm_category'] = df_clean['event'].apply(categorize_alarm)
+        
+        cat1_pairs = (df_clean[df_clean['alarm_category'] == cat1]
+                     .drop_duplicates(['src_site','dest_site'])
+                     [['src_site','dest_site']])
+        cat2_pairs = (df_clean[df_clean['alarm_category'] == cat2]
+                     .drop_duplicates(['src_site','dest_site'])
+                     [['src_site','dest_site']])
+        
+        # Find pairs that have both categories
+        cat1_pairs['has_cat1'] = True
+        cat2_pairs['has_cat2'] = True
+        
+        merged = cat1_pairs.merge(cat2_pairs, on=['src_site','dest_site'], how='outer').fillna(False)
+        cooccur = merged[(merged['has_cat1'] == True) & (merged['has_cat2'] == True)]
+        
+        return cooccur[['src_site','dest_site']]
+    
+    # === SITE PAIR HEATMAP (BINARY) - OVERALL ===
     cooccur_pairs = pairs_df[pairs_df['cooccur']].copy()
     
     if not cooccur_pairs.empty:
@@ -1030,6 +1072,69 @@ def plot_correlation_heatmaps(alarms_df, target_date, figsize=(20, 8)):
         ax2.set_title('Country Pair Correlations - No Data')
         country_heatmap_data = None
     
+    # === NEW SPECIFIC CORRELATION HEATMAPS ===
+    correlations_to_plot = [
+        ('asn', 'delay', 'ASN ↔ Delay', ax_flat[2], 'Blues'),
+        ('asn', 'loss', 'ASN ↔ Loss', ax_flat[3], 'Oranges'),
+        ('asn', 'throughput', 'ASN ↔ Throughput', ax_flat[4], 'Greens'),
+        ('delay', 'loss', 'Delay ↔ Loss', ax_flat[5], 'Purples'),
+        ('loss', 'throughput', 'Loss ↔ Throughput', ax_flat[6], 'YlOrRd')
+    ]
+    
+    site_heatmap_data_specific = {}
+    
+    for cat1, cat2, title, ax, cmap in correlations_to_plot:
+        specific_cooccur = get_specific_correlations(day_alarms, cat1, cat2)
+        
+        if not specific_cooccur.empty:
+            # Get only sites involved in this specific correlation type
+            corr_sites = set(specific_cooccur['src_site'].dropna()) | set(specific_cooccur['dest_site'].dropna())
+            corr_sites = sorted([s for s in corr_sites if pd.notna(s)])
+            
+            # Create binary matrix only for relevant sites
+            specific_matrix = pd.DataFrame(0, index=corr_sites, columns=corr_sites)
+            
+            # Fill matrix with correlations
+            for _, row in specific_cooccur.iterrows():
+                src, dest = row['src_site'], row['dest_site']
+                if pd.notna(src) and pd.notna(dest):
+                    specific_matrix.loc[src, dest] = 1
+                    specific_matrix.loc[dest, src] = 1  # Make symmetric
+            
+            # Plot heatmap - only show labels if reasonable number of sites
+            show_labels = len(corr_sites) <= 15
+            
+            sns.heatmap(specific_matrix, annot=False, cmap=cmap, vmin=0, vmax=1,
+                       cbar_kws={'label': 'Co-occurrence', 'ticks': [0, 1]}, 
+                       ax=ax, square=True, linewidths=0.5, 
+                       xticklabels=show_labels, yticklabels=show_labels)
+            ax.set_title(f'{title}\n({len(specific_cooccur)} pairs, {len(corr_sites)} sites)', fontsize=10)
+            
+            if show_labels:
+                ax.set_xlabel('Destination Site', fontsize=8)
+                ax.set_ylabel('Source Site', fontsize=8)
+                ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right', fontsize=7)
+                ax.set_yticklabels(ax.get_yticklabels(), rotation=0, fontsize=7)
+            else:
+                ax.set_xlabel(f'{len(corr_sites)} Sites', fontsize=8)
+                ax.set_ylabel(f'{len(corr_sites)} Sites', fontsize=8)
+            
+            site_heatmap_data_specific[f'{cat1}_vs_{cat2}'] = specific_matrix
+        else:
+            # Make empty plots less prominent
+            ax.text(0.5, 0.5, f'No {title.lower()}\ncorrelations', 
+                   ha='center', va='center', transform=ax.transAxes, fontsize=9, 
+                   bbox=dict(boxstyle='round,pad=0.3', facecolor='lightgray', alpha=0.5))
+            ax.set_title(f'{title}\n(0 pairs)', fontsize=10)
+            ax.set_facecolor('whitesmoke')
+            ax.set_xticks([])
+            ax.set_yticks([])
+            site_heatmap_data_specific[f'{cat1}_vs_{cat2}'] = None
+    
+    # Hide unused subplot (we use 7 out of 8 subplots in 4x2 layout)
+    if len(ax_flat) > 7:
+        ax_flat[7].set_visible(False)
+    
     plt.tight_layout()
     plt.show()
     
@@ -1048,8 +1153,22 @@ def plot_correlation_heatmaps(alarms_df, target_date, figsize=(20, 8)):
         if country_heatmap_data is not None:
             total_country_pairs = int(country_heatmap_data.sum().sum() / 2)  # Divide by 2 since symmetric
             print(f"  • Total country-level co-occurring pairs: {total_country_pairs}")
+        
+        # Print specific correlation counts
+        print(f"\n🔍 Specific Correlation Breakdowns:")
+        for cat1, cat2, title, _, _ in correlations_to_plot:
+            specific_data = site_heatmap_data_specific.get(f'{cat1}_vs_{cat2}')
+            if specific_data is not None:
+                count = int(specific_data.sum().sum() / 2)  # Divide by 2 since symmetric
+                print(f"  • {title}: {count} co-occurring pairs")
+            else:
+                print(f"  • {title}: 0 co-occurring pairs")
     
-    return site_heatmap_data, country_heatmap_data
+    return {
+        'site_overall': site_heatmap_data,
+        'country_overall': country_heatmap_data,
+        'specific_correlations': site_heatmap_data_specific
+    }
 
 
 
