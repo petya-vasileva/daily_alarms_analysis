@@ -1,0 +1,15 @@
+creds.key
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# OS files
+.DS_Store
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/*
+
+# Exclude Jupyter Notebook outputs
+# *.ipynb
