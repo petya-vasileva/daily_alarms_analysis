@@ -3,11 +3,12 @@
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from helpers import ConnectES
 import json
 import hashlib
 from typing import Dict, List, Optional, Tuple, Union
 import warnings
+from helpers import ConnectES
+
 warnings.filterwarnings('ignore')
 
 class BaselineManager:
@@ -403,12 +404,9 @@ class BaselineManager:
         
         # Get baseline data
         try:
-            # Import queryData function
-            import sys
-            sys.path.append('/Users/petyav/workspace/current/throughput_on_paths')
-            from ps_throughput import queryData
+            # Use internal queryData function (copied from AAAS ps_throughput.py)
             
-            baseline_data = queryData(baseline_start_str, baseline_end_str)
+            baseline_data = self._queryData_throughput(baseline_start_str, baseline_end_str)
             baseline_df = pd.DataFrame(baseline_data)
             
             if baseline_df.empty:
@@ -500,13 +498,10 @@ class BaselineManager:
         
         # Get baseline data ONCE for all pairs
         try:
-            # Import queryData function
-            import sys
-            sys.path.append('/Users/petyav/workspace/current/throughput_on_paths')
-            from ps_throughput import queryData
+            # Use internal queryData function (copied from AAAS ps_throughput.py)
             
             print(f"   📊 Querying baseline data: {baseline_start_str} to {baseline_end_str}")
-            baseline_data = queryData(baseline_start_str, baseline_end_str)
+            baseline_data = self._queryData_throughput(baseline_start_str, baseline_end_str)
             baseline_df = pd.DataFrame(baseline_data)
             
             if baseline_df.empty:
@@ -728,8 +723,7 @@ class BaselineManager:
             
             # Method 3: Minimum with buffer (min + 10% for noise tolerance)
             buffered_min = min_owd * 1.1
-            
-            # Choose the best baseline based on data characteristics
+
             if owd_stats['count'] >= 100:
                 # Sufficient data: use 5th percentile
                 expected_owd = statistical_baseline
@@ -742,8 +736,10 @@ class BaselineManager:
                 # Limited data: use minimum
                 expected_owd = min_owd
                 baseline_method = 'minimum'
-            
-            # Determine baseline quality
+
+            # We can be more precise with the expected number of measurements
+            # by considering the distribution of existing measurements or 
+            # calculating the ideal measurement count based on the time window
             if owd_stats['count'] >= 100:
                 baseline_quality = 'excellent'
             elif owd_stats['count'] >= 50:
@@ -755,7 +751,7 @@ class BaselineManager:
             else:
                 baseline_quality = 'insufficient'
             
-            # Add derived metrics
+            # derived metrics
             owd_stats.update({
                 'mode': mode_delay,
                 'baseline_method': baseline_method,
@@ -854,3 +850,167 @@ class BaselineManager:
         print(f"   • Cache efficiency: {self.cache_hits}/{self.query_count} queries cached")
         
         return df
+    
+    # Helper functions copied from AAAS ps_throughput.py script
+    def _query4Avg_throughput(self, dateFrom, dateTo):
+        """
+        Query throughput data with averaging (copied from AAAS ps_throughput.py)
+        """
+        query = {
+            "bool": {
+                "must": [
+                    {
+                        "range": {
+                            "timestamp": {
+                                "gt": dateFrom,
+                                "lte": dateTo
+                            }
+                        }
+                    },
+                    {
+                        "term": {
+                            "src_production": True
+                        }
+                    },
+                    {
+                        "term": {
+                            "dest_production": True
+                        }
+                    }
+                ]
+            }
+        }
+        
+        aggregations = {
+            "groupby": {
+                "composite": {
+                    "size": 9999,
+                    "sources": [
+                        {"ipv6": {"terms": {"field": "ipv6"}}},
+                        {"src": {"terms": {"field": "src"}}},
+                        {"dest": {"terms": {"field": "dest"}}},
+                        {"src_host": {"terms": {"field": "src_host"}}},
+                        {"dest_host": {"terms": {"field": "dest_host"}}},
+                        {"src_site": {"terms": {"field": "src_netsite"}}},
+                        {"dest_site": {"terms": {"field": "dest_netsite"}}}
+                    ]
+                },
+                "aggs": {
+                    "throughput": {
+                        "avg": {
+                            "field": "throughput"
+                        }
+                    }
+                }
+            }
+        }
+        
+        aggrs = []
+        aggdata = self.es.search(index='ps_throughput', query=query, aggregations=aggregations)
+        
+        for item in aggdata['aggregations']['groupby']['buckets']:
+            aggrs.append({
+                'hash': str(item['key']['src'] + '-' + item['key']['dest']),
+                'from': dateFrom, 'to': dateTo,
+                'ipv6': item['key']['ipv6'],
+                'src': item['key']['src'], 'dest': item['key']['dest'],
+                'src_host': item['key']['src_host'], 'dest_host': item['key']['dest_host'],
+                'src_site': item['key']['src_site'], 'dest_site': item['key']['dest_site'],
+                'value': item['throughput']['value'],
+                'doc_count': item['doc_count']
+            })
+        
+        return aggrs
+    
+    def _normalize_to_iso8601(self, date_str):
+        """
+        Ensure date string is in ISO 8601 format (copied from AAAS ps_throughput.py)
+        """
+        if not isinstance(date_str, str):
+            date_str = str(date_str)
+        
+        # Try ISO first
+        try:
+            dt = datetime.strptime(date_str, '%Y-%m-%dT%H:%M:%S.000Z')
+            return dt.strftime('%Y-%m-%dT%H:%M:%S.000Z')
+        except ValueError:
+            pass
+        
+        # Try fallback format
+        try:
+            dt = datetime.strptime(date_str, '%Y-%m-%d %H:%M')
+            return dt.strftime('%Y-%m-%dT%H:%M:%S.000Z')
+        except ValueError:
+            pass
+        
+        # Return as-is if not recognized
+        return date_str
+    
+    def _iso8601_to_ymdhm(self, date_str):
+        """
+        Convert ISO 8601 to '%Y-%m-%d %H:%M' format (copied from AAAS ps_throughput.py)
+        """
+        if not isinstance(date_str, str):
+            date_str = str(date_str)
+        try:
+            dt = datetime.strptime(date_str, '%Y-%m-%dT%H:%M:%S.000Z')
+            return dt.strftime('%Y-%m-%d %H:%M')
+        except ValueError:
+            return date_str
+    
+    def _calc_minutes_4_period(self, dateFrom, dateTo):
+        """
+        Calculate minutes in period (copied from AAAS helpers.py)
+        """
+        fmt = '%Y-%m-%d %H:%M'
+        d1 = datetime.strptime(dateFrom, fmt)
+        d2 = datetime.strptime(dateTo, fmt)
+        time_delta = d2 - d1
+        return (time_delta.days * 24 * 60 + time_delta.seconds // 60)
+    
+    def _get_time_ranges(self, dateFrom, dateTo, intv=1):
+        """
+        Split period into chunks (copied from AAAS helpers.py)
+        """
+        fmt = '%Y-%m-%d %H:%M'
+        d1 = datetime.strptime(dateFrom, fmt)
+        d2 = datetime.strptime(dateTo, fmt)
+        diff = (d2 - d1) / intv
+        
+        t_format = "%Y-%m-%d %H:%M"
+        tl = []
+        for i in range(intv + 1):
+            t = (datetime.strptime(dateFrom, t_format) + diff * i).strftime(t_format)
+            tl.append(t)
+        
+        return tl
+    
+    def _queryData_throughput(self, dateFrom, dateTo):
+        """
+        Query throughput data in chunks (copied from AAAS ps_throughput.py)
+        ES does not allow aggregations with more than 10000 bins
+        """
+        data = []
+        
+        # Normalize dates to ISO 8601 format for ES
+        dateFrom_iso = self._normalize_to_iso8601(dateFrom)
+        dateTo_iso = self._normalize_to_iso8601(dateTo)
+        
+        # Convert to '%Y-%m-%d %H:%M' for helper functions
+        dateFrom_h = self._iso8601_to_ymdhm(dateFrom_iso)
+        dateTo_h = self._iso8601_to_ymdhm(dateTo_iso)
+        
+        # Query in portions
+        intv = int(self._calc_minutes_4_period(dateFrom_h, dateTo_h) / 60)
+        if intv < 1:
+            intv = 1
+            
+        time_list = self._get_time_ranges(dateFrom_h, dateTo_h, intv)
+        
+        for i in range(len(time_list) - 1):
+            # Convert back to ISO for ES queries
+            t_from = self._normalize_to_iso8601(time_list[i])
+            t_to = self._normalize_to_iso8601(time_list[i + 1])
+            data.extend(self._query4Avg_throughput(t_from, t_to))
+        
+        return data

@@ -152,10 +152,7 @@ class FocusedDataCollector:
         for src_site, dest_site in self.db_focus_pairs:
             print(f"   📡 Querying throughput: {src_site} ↔ {dest_site}...")
             
-            try:
-                # Import query function and query for this specific pair
-                from ps_throughput import queryData
-                
+            try:                
                 # Query throughput data for this specific pair
                 pair_data = self._query_throughput_for_pair(src_site, dest_site)
                 
