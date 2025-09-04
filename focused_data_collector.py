@@ -15,7 +15,7 @@ from baseline_manager import BaselineManager
 import utils.helpers as hp
 
 class FocusedDataCollector:
-    def __init__(self, date_from_str, date_to_str, focus_pairs, baseline_days=21):
+    def __init__(self, date_from_str, date_to_str, focus_pairs, baseline_days=21, include_reverse_pairs=False):
         """
         Initialize focused data collector
         
@@ -29,35 +29,46 @@ class FocusedDataCollector:
             List of (src_site, dest_site) pairs to collect data for (UPPERCASE from alarms)
         baseline_days : int
             Days to look back for baseline calculation (default: 21)
+        include_reverse_pairs : bool
+            Whether to also collect data for reverse direction pairs (default: False)
+            WARNING: This doubles the number of queries and data volume
         """
         self.date_from = date_from_str
         self.date_to = date_to_str
         self.focus_pairs = focus_pairs
         self.baseline_days = baseline_days
+        self.include_reverse_pairs = include_reverse_pairs
         self.baseline_manager = BaselineManager()
         
         # Parse dates for calculations (ensure UTC timezone)
         self.date_from_dt = pd.to_datetime(date_from_str, utc=True).to_pydatetime()
         self.date_to_dt = pd.to_datetime(date_to_str, utc=True).to_pydatetime()
         
+        # Add reverse pairs if requested
+        if self.include_reverse_pairs:
+            original_pairs = list(focus_pairs)  # Make a copy
+            reverse_pairs = [(dest, src) for src, dest in original_pairs if (dest, src) not in original_pairs]
+            self.focus_pairs = original_pairs + reverse_pairs
+            print(f"🔄 Added {len(reverse_pairs)} reverse pairs (total: {len(self.focus_pairs)})")
+        
         print(f"🎯 Focused data collector initialized")
         print(f"   Analysis period: {date_from_str} to {date_to_str}")
-        print(f"   Focus pairs: {len(focus_pairs)} site pairs (from alarm analysis)")
+        print(f"   Focus pairs: {len(self.focus_pairs)} site pairs ({'bidirectional' if include_reverse_pairs else 'unidirectional'})")
         print(f"   Baseline lookback: {baseline_days} days")
         
         # Map uppercase focus pairs to actual database site names
-        print(f"\n📍 Mapping site names from alarms to database...")
+        # print(f"\n📍 Mapping site names from alarms to database...")
         self.site_name_mapping = self._build_site_name_mapping()
         self.db_focus_pairs = self._map_focus_pairs_to_db_names()
         
         print(f"   ✅ Mapped {len(self.db_focus_pairs)} pairs to database site names")
         
-        # Show focus pairs
-        for i, (src, dest) in enumerate(self.db_focus_pairs[:5]):
-            alarm_src, alarm_dest = focus_pairs[i]
-            print(f"      {i+1}. {alarm_src} ↔ {alarm_dest} → {src} ↔ {dest}")
-        if len(focus_pairs) > 5:
-            print(f"      ... and {len(focus_pairs) - 5} more pairs")
+        # # Show focus pairs
+        # for i, (src, dest) in enumerate(self.db_focus_pairs[:5]):
+        #     alarm_src, alarm_dest = focus_pairs[i]
+        #     print(f"      {i+1}. {alarm_src} ↔ {alarm_dest} → {src} ↔ {dest}")
+        # if len(focus_pairs) > 5:
+        #     print(f"      ... and {len(focus_pairs) - 5} more pairs")
 
     def _build_site_name_mapping(self):
         all_alarm_sites = set()
@@ -67,7 +78,7 @@ class FocusedDataCollector:
         
         site_mapping = {}
         
-        print(f"   🔍 Looking up {len(all_alarm_sites)} unique sites in database...")
+        # print(f"   🔍 Looking up {len(all_alarm_sites)} unique sites in database...")
         
         # Query each site to find its actual database name
         for alarm_site in all_alarm_sites:
@@ -117,7 +128,7 @@ class FocusedDataCollector:
                         db_name = alarm_site  # Fallback
                     
                     site_mapping[alarm_site] = db_name
-                    print(f"      • {alarm_site} → {db_name}")
+                    # print(f"      • {alarm_site} → {db_name}")
                 else:
                     # No match found, use as-is
                     site_mapping[alarm_site] = alarm_site
@@ -150,7 +161,7 @@ class FocusedDataCollector:
         
         # Query each focus pair individually to minimize data transfer (using database site names)
         for src_site, dest_site in self.db_focus_pairs:
-            print(f"   📡 Querying throughput: {src_site} ↔ {dest_site}...")
+            # print(f"   📡 Querying throughput: {src_site} ↔ {dest_site}...")
             
             try:                
                 # Query throughput data for this specific pair
@@ -233,6 +244,9 @@ class FocusedDataCollector:
         
         print(f"   🚨 Performance flags: {current_df['thr_perf_flag'].sum()} degraded throughput events")
         
+        # Throughput filling will be done later after trace data is collected
+        # (needed for symmetric path validation)
+        
         return current_df
     
     def _query_throughput_for_pair(self, src_site, dest_site):
@@ -307,6 +321,174 @@ class FocusedDataCollector:
         except Exception as e:
             print(f"         ❌ ES query failed: {e}")
             return []
+    
+    def _fill_symmetric_throughput(self, throughput_df, trace_df, validation_mode='strict'):
+        """
+        Fill missing throughput measurements using reverse direction when available
+        and ASN paths are symmetric
+        
+        This helps with the low frequency of throughput tests - if we have A→B but not B→A,
+        and the ASN paths are symmetric, we can use A→B value for B→A.
+        """
+        print(f"   🔄 Analyzing bidirectional throughput coverage with path symmetry validation...")
+        
+        original_count = len(throughput_df)
+        
+        # Group by site pairs to find missing reverse directions
+        pairs_with_data = set(zip(throughput_df['src_site'], throughput_df['dest_site']))
+        
+        missing_reverse = []
+        filled_count = 0
+        symmetric_validated = 0
+        asymmetric_skipped = 0
+        
+        for src, dest in pairs_with_data:
+            reverse_pair = (dest, src)
+            
+            if reverse_pair not in pairs_with_data:
+                # We have A→B but not B→A - check if paths are symmetric
+                is_symmetric = self._check_path_symmetry(src, dest, trace_df, validation_mode)
+                
+                if is_symmetric:
+                    forward_data = throughput_df[
+                        (throughput_df['src_site'] == src) & 
+                        (throughput_df['dest_site'] == dest)
+                    ].copy()
+                    
+                    if not forward_data.empty:
+                        # Create reverse direction entries
+                        reverse_data = forward_data.copy()
+                        reverse_data['src_site'] = dest
+                        reverse_data['dest_site'] = src
+                        reverse_data['hash'] = reverse_data['dest'] + '-' + reverse_data['src']  # Swap hash
+                        
+                        # Swap IP addresses and hosts if available
+                        if 'src' in reverse_data.columns and 'dest' in reverse_data.columns:
+                            reverse_data['src'], reverse_data['dest'] = reverse_data['dest'], reverse_data['src']
+                        if 'src_host' in reverse_data.columns and 'dest_host' in reverse_data.columns:
+                            reverse_data['src_host'], reverse_data['dest_host'] = reverse_data['dest_host'], reverse_data['src_host']
+                        
+                        # Add flag to indicate this is filled data
+                        reverse_data['throughput_filled'] = True
+                        
+                        # Add to missing reverse list
+                        missing_reverse.append({
+                            'original_pair': (src, dest),
+                            'filled_pair': (dest, src),
+                            'measurements': len(reverse_data),
+                            'symmetric': True
+                        })
+                        
+                        # Append to throughput_df
+                        throughput_df = pd.concat([throughput_df, reverse_data], ignore_index=True)
+                        filled_count += len(reverse_data)
+                        symmetric_validated += 1
+                else:
+                    # Paths are not symmetric - skip filling
+                    asymmetric_skipped += 1
+        
+        # Add throughput_filled flag to original data
+        if 'throughput_filled' not in throughput_df.columns:
+            throughput_df['throughput_filled'] = False
+            throughput_df.loc[throughput_df.index < original_count, 'throughput_filled'] = False
+        
+        print(f"      📊 Path symmetry validation:")
+        print(f"         • Symmetric pairs (filled): {symmetric_validated}")
+        print(f"         • Asymmetric pairs (skipped): {asymmetric_skipped}")
+        
+        if missing_reverse:
+            print(f"      ✅ Filled {len(missing_reverse)} symmetric pairs ({filled_count} measurements)")
+            print(f"      📊 Total throughput measurements: {original_count} → {len(throughput_df)}")
+            
+            # Show examples
+            for i, fill_info in enumerate(missing_reverse[:3]):
+                orig = fill_info['original_pair']
+                filled = fill_info['filled_pair']
+                count = fill_info['measurements']
+                print(f"         {i+1}. {orig[0]} → {orig[1]} ({count} measurements) → filled {filled[0]} → {filled[1]}")
+            
+            if len(missing_reverse) > 3:
+                print(f"         ... and {len(missing_reverse) - 3} more symmetric pairs")
+        else:
+            print(f"      ℹ️ No fillable symmetric pairs found")
+        
+        return throughput_df
+    
+    def _check_path_symmetry(self, src_site, dest_site, trace_df, validation_mode='strict'):
+        """
+        Check if ASN paths between two sites are symmetric by comparing ASN sequences
+        
+        Parameters:
+        -----------
+        validation_mode : str
+            'strict' - exact reverse path match required
+            'relaxed' - allow minor differences (length ±1, 80% ASN overlap)
+            'lenient' - just check that both directions have stable paths
+        
+        Returns True if paths are considered symmetric based on validation mode
+        """
+        # Get traces for both directions
+        forward_traces = trace_df[
+            (trace_df['src_site'] == src_site) & 
+            (trace_df['dest_site'] == dest_site)
+        ]
+        reverse_traces = trace_df[
+            (trace_df['src_site'] == dest_site) & 
+            (trace_df['dest_site'] == src_site)
+        ]
+        
+        if forward_traces.empty or reverse_traces.empty:
+            return False  # Can't validate symmetry without both directions
+        
+        # Get most common ASN paths for each direction
+        forward_asn_paths = forward_traces['asns'].apply(
+            lambda x: tuple(asn for asn in x if asn and asn != 0)  # Clean and convert to tuple
+        ).value_counts()
+        
+        reverse_asn_paths = reverse_traces['asns'].apply(
+            lambda x: tuple(asn for asn in x if asn and asn != 0)  # Clean and convert to tuple
+        ).value_counts()
+        
+        if forward_asn_paths.empty or reverse_asn_paths.empty:
+            return False
+        
+        # Get the most common paths
+        forward_common_path = forward_asn_paths.index[0]
+        reverse_common_path = reverse_asn_paths.index[0]
+        
+        if validation_mode == 'strict':
+            # Exact reverse match required
+            return forward_common_path == reverse_common_path[::-1]
+        
+        elif validation_mode == 'relaxed':
+            # Allow minor differences: length ±1, 80% ASN overlap
+            expected_reverse = forward_common_path[::-1]
+            
+            # Check length difference
+            len_diff = abs(len(reverse_common_path) - len(expected_reverse))
+            if len_diff > 1:
+                return False
+            
+            # Check ASN overlap
+            forward_asns = set(forward_common_path)
+            reverse_asns = set(reverse_common_path)
+            overlap = len(forward_asns.intersection(reverse_asns))
+            total_unique = len(forward_asns.union(reverse_asns))
+            
+            overlap_ratio = overlap / max(total_unique, 1)
+            return overlap_ratio >= 0.8
+        
+        elif validation_mode == 'lenient':
+            # Just check that both directions have stable dominant paths
+            forward_stability = forward_asn_paths.iloc[0] / len(forward_traces)
+            reverse_stability = reverse_asn_paths.iloc[0] / len(reverse_traces)
+            
+            # Both directions should have >50% consistency
+            return forward_stability > 0.5 and reverse_stability > 0.5
+        
+        else:
+            # Default to strict
+            return forward_common_path == reverse_common_path[::-1]
 
     def collect_owd_data_focused(self, aggregate_minutes=10):
         """
@@ -322,7 +504,7 @@ class FocusedDataCollector:
         
         # Query each focus pair individually to limit data at source (using database site names)
         for src_site, dest_site in self.db_focus_pairs:
-            print(f"   📡 Querying {src_site} → {dest_site}...")
+            # print(f"   📡 Querying {src_site} → {dest_site}...")
             
             query = {
                 "size": 0,
@@ -621,7 +803,7 @@ class FocusedDataCollector:
                 traces_for_pair = result['hits']['hits']
                 all_traces.extend(traces_for_pair)
                 
-                print(f"      • {src_site} → {dest_site}: {len(traces_for_pair)} traces")
+                # print(f"      • {src_site} → {dest_site}: {len(traces_for_pair)} traces")
                 
             except Exception as e:
                 print(f"      ❌ Error querying traces for {src_site} → {dest_site}: {e}")
@@ -698,6 +880,15 @@ class FocusedDataCollector:
         results['owd_df'] = self.collect_owd_data_focused()
         results['loss_df'] = self.collect_packetloss_data_focused()
         results['trace_df'] = self.collect_traceroute_data_focused()
+        
+        # Handle bidirectional throughput filling after trace data is available
+        if self.include_reverse_pairs and not results['throughput_df'].empty and not results['trace_df'].empty:
+            print(f"\n🔄 APPLYING SYMMETRIC THROUGHPUT FILLING")
+            results['throughput_df'] = self._fill_symmetric_throughput(
+                results['throughput_df'], 
+                results['trace_df'],
+                validation_mode='relaxed'  # Try relaxed validation first
+            )
         
         # Create unified performance dataset
         print("\n🔗 CREATING UNIFIED PERFORMANCE DATASET")
@@ -824,11 +1015,11 @@ class FocusedDataCollector:
         return combined_df
 
 
-def main_from_cooccurrence_windows(cooccurrence_windows_df, date_from, date_to):
+def main_from_cooccurrence_windows(cooccurrence_windows_df, date_from, date_to, include_reverse_pairs=False):
     focus_pairs = cooccurrence_windows_df[['src_site', 'dest_site']].drop_duplicates().values.tolist()
     
     print(f"🎯 Extracted {len(focus_pairs)} focus pairs from cooccurrence windows")
-    collector = FocusedDataCollector(date_from, date_to, focus_pairs, baseline_days=21)
+    collector = FocusedDataCollector(date_from, date_to, focus_pairs, baseline_days=21, include_reverse_pairs=include_reverse_pairs)
     datasets = collector.collect_focused_data()
     
     return datasets
@@ -836,8 +1027,8 @@ def main_from_cooccurrence_windows(cooccurrence_windows_df, date_from, date_to):
 
 
 
-def main_with_pairs(focus_pairs_list, date_from, date_to):
-    collector = FocusedDataCollector(date_from, date_to, focus_pairs_list, baseline_days=21)
+def main_with_pairs(focus_pairs_list, date_from, date_to, include_reverse_pairs=False):
+    collector = FocusedDataCollector(date_from, date_to, focus_pairs_list, baseline_days=21, include_reverse_pairs=include_reverse_pairs)
     datasets = collector.collect_focused_data()
     
     return datasets

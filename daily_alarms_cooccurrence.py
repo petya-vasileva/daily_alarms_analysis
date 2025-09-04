@@ -41,8 +41,8 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # Local imports
-import helpers as hp
-from site_geography import add_geography_to_dataframe
+import utils.helpers as hp
+from utils.site_geography import add_geography_to_dataframe
 
 
 
@@ -545,6 +545,42 @@ def analyze_alarm_correlations(days_back=14):
                 print(f"      Days affected: {impact['days_affected']}, Time span: {impact['time_span_hours']:.1f} hours")
                 print(f"      Date range: {impact['date_range']}")
 
+        # Extract cooccurring pairs for each date
+        cooccurring_pairs_by_date = {}
+        
+        for date in unique_dates:
+            daily_alarms = alarms_df[alarms_df['date'] == date].copy()
+            
+            # Get pairs that have both ASN and performance events on this date
+            pairs_df, summary = same_day_pair_overlap_exact(daily_alarms)
+            
+            if not pairs_df.empty:
+                cooccur_pairs = pairs_df[pairs_df['cooccur']][['src_site', 'dest_site']].values.tolist()
+                if cooccur_pairs:
+                    date_str = str(date)
+                    cooccurring_pairs_by_date[date_str] = {
+                        'pairs': cooccur_pairs,
+                        'count': len(cooccur_pairs),
+                        'correlation_strength': float(summary.iloc[0]['R_asn']) if not summary.empty else 0.0,
+                        'asn_pairs': int(summary.iloc[0]['n_pairs_asn']) if not summary.empty else 0,
+                        'perf_pairs': int(summary.iloc[0]['n_pairs_perf']) if not summary.empty else 0
+                    }
+        
+        print(f"\n📊 Cooccurring Pairs Summary:")
+        print(f"  • Dates with cooccurring pairs: {len(cooccurring_pairs_by_date)}")
+        if cooccurring_pairs_by_date:
+            total_unique_pairs = set()
+            for date_data in cooccurring_pairs_by_date.values():
+                total_unique_pairs.update(tuple(pair) for pair in date_data['pairs'])
+            print(f"  • Total unique cooccurring pairs across all dates: {len(total_unique_pairs)}")
+            
+            # Show top dates by pair count
+            sorted_dates = sorted(cooccurring_pairs_by_date.items(), 
+                                key=lambda x: x[1]['count'], reverse=True)
+            print(f"\n🎯 Top dates by cooccurring pairs:")
+            for date, data in sorted_dates[:5]:
+                print(f"    • {date}: {data['count']} pairs, R={data['correlation_strength']:.3f}")
+
         return {
             'alarms_df': alarms_df,
             'alarms_raw_df': alarms_raw_df,
@@ -552,7 +588,8 @@ def analyze_alarm_correlations(days_back=14):
             'daily_correlations': daily_correlations,
             'co_occurring_days': co_occurring_days,
             'rerouted_pairs_impact': rerouted_pairs_impact,
-            'site_pair_events': dict(site_pair_events)
+            'site_pair_events': dict(site_pair_events),
+            'cooccurring_pairs_by_date': cooccurring_pairs_by_date
         }
 
     except Exception as e:
@@ -1072,7 +1109,6 @@ def plot_correlation_heatmaps(alarms_df, target_date, figsize=(20, 30)):
         ax2.set_title('Country Pair Correlations - No Data')
         country_heatmap_data = None
     
-    # === NEW SPECIFIC CORRELATION HEATMAPS ===
     correlations_to_plot = [
         ('asn', 'delay', 'ASN ↔ Delay', ax_flat[2], 'Blues'),
         ('asn', 'loss', 'ASN ↔ Loss', ax_flat[3], 'Oranges'),

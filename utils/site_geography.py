@@ -13,7 +13,7 @@ import os
 from difflib import get_close_matches
 import ssl
 import urllib3
-import helpers as hp
+from . import helpers as hp
 
 def get_known_sites_fallback():
     """
@@ -373,7 +373,7 @@ def guess_site_country(site_name, site_countries, threshold=0.6):
             print(f"   🔄 Variation matched '{site_name}' → '{variation}'")
             return site_countries[variation]
     
-    # Enhanced substring matching - extract meaningful parts
+    # Substring matching - extract meaningful parts
     # Remove common suffixes/prefixes that aren't site identifiers
     cleanup_patterns = ['LHCONE', 'LHCOPN', 'LCG2', 'T1', 'T2', '-', '_']
     
@@ -428,7 +428,7 @@ def guess_site_country(site_name, site_countries, threshold=0.6):
     return None
 
 def test_site_matching(test_sites=None):
-    """Test the enhanced site matching with problem cases."""
+    """Test site matching with problem cases."""
     if test_sites is None:
         test_sites = [
             # Sites that should be found in ps_alarms_meta
@@ -440,7 +440,7 @@ def test_site_matching(test_sites=None):
         ]
     
     site_countries = get_site_countries()  # Use the correct function name
-    print(f"🧪 Testing enhanced site matching on {len(test_sites)} problematic sites:")
+    print(f"🧪 Testing site matching on {len(test_sites)} problematic sites:")
     print("="*80)
     
     matched = 0

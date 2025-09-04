@@ -1,22 +1,22 @@
-# baseline_manager.py
-
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import json
 import hashlib
-from typing import Dict, List, Optional, Tuple, Union
+import time
+from typing import Dict, List, Optional, Tuple
 import warnings
-from helpers import ConnectES
+from utils.helpers import ConnectES
 
 warnings.filterwarnings('ignore')
 
 class BaselineManager:
     """
-    This class manages baselines for:
+    Manages baselines for network performance analysis:
     1. Expected path lengths (based on historical successful traces)
     2. Destination reachability flags (never reached in time window)
     3. Expected one-way delays (minimum, percentiles, and statistical baselines)
+    4. Throughput baselines (simple and bulk processing)
     """
     
     def __init__(self, cache_enabled=True):
@@ -500,7 +500,7 @@ class BaselineManager:
         try:
             # Use internal queryData function (copied from AAAS ps_throughput.py)
             
-            print(f"   📊 Querying baseline data: {baseline_start_str} to {baseline_end_str}")
+            # print(f"   📊 Querying baseline data: {baseline_start_str} to {baseline_end_str}")
             baseline_data = self._queryData_throughput(baseline_start_str, baseline_end_str)
             baseline_df = pd.DataFrame(baseline_data)
             
@@ -602,7 +602,7 @@ class BaselineManager:
             - owd_stats: comprehensive delay statistics
             - baseline_quality: quality indicator
         """
-        print(f"⏱️  Calculating expected OWD: {src} → {dest} ({field_type})")
+        # print(f"⏱️  Calculating expected OWD: {src} → {dest} ({field_type})")
         
         if field_type not in ["netsite", "host"]:
             raise ValueError(f"field_type must be 'netsite' or 'host', got '{field_type}'")
@@ -1014,3 +1014,235 @@ class BaselineManager:
             data.extend(self._query4Avg_throughput(t_from, t_to))
         
         return data
+
+def get_throughput_baseline_for_pairs(unique_pairs, reference_date, baseline_days=21):
+    """
+    Get throughput baselines for all pairs efficiently
+    
+    Parameters:
+    -----------
+    unique_pairs : DataFrame
+        DataFrame with src_site and dest_site columns
+    reference_date : datetime
+        Reference date (baseline calculated before this date)
+    baseline_days : int
+        Days to look back (default: 21)
+    
+    Returns:
+    --------
+    dict
+        Dictionary with (src_site, dest_site) keys and baseline statistics as values
+    """
+    print(f"📊 Getting baselines for {len(unique_pairs)} pairs efficiently...")
+    
+    pair_list = [(row['src_site'], row['dest_site']) for _, row in unique_pairs.iterrows()]
+    
+    manager = BaselineManager()
+    baseline_results = manager.get_bulk_simple_throughput_baselines(pair_list, reference_date, baseline_days)
+    
+    return baseline_results
+
+def get_throughput_with_baselines(date_from_str, date_to_str, baseline_days=21, max_workers=10):
+    """
+    Get throughput data with baselines using parallel processing
+    
+    Parameters:
+    -----------
+    date_from_str : str
+        Start date for throughput analysis (ISO format)
+    date_to_str : str
+        End date for throughput analysis (ISO format)  
+    baseline_days : int
+        Days to look back for baseline (default: 21)
+    max_workers : int
+        Maximum concurrent threads for baseline calculation (default: 10)
+    Returns:
+    --------
+    pandas.DataFrame
+        DataFrame with throughput data and baseline columns
+    """
+    
+    print(f"🚀 Getting throughput data with baselines")
+    print(f"   Analysis period: {date_from_str} to {date_to_str}")
+    print(f"   Baseline lookback: {baseline_days} days")
+    print(f"   Max workers: {max_workers}")
+    
+    # Get current throughput data
+    print("\n📊 Querying current throughput data...")
+    from ps_throughput import queryData
+    current_data = queryData(date_from_str, date_to_str)
+    current_df = pd.DataFrame(current_data)
+    
+    if current_df.empty:
+        print("   ⚠️ No current throughput data found")
+        return pd.DataFrame()
+    
+    # Process current data
+    current_df['dt'] = pd.to_datetime(current_df['from'], unit='ms')
+    current_df['src_site'] = current_df['src_site'].str.upper()
+    current_df['dest_site'] = current_df['dest_site'].str.upper()
+    current_df['value_mbps'] = current_df['value'] * 1e-6
+    
+    booleanDictionary = {True: 'ipv6', False: 'ipv4'}
+    current_df['ipv'] = current_df['ipv6'].map(booleanDictionary)
+    
+    print(f"   📈 Found {len(current_df)} current measurements")
+    
+    # Get unique pairs
+    unique_pairs = current_df[['src_site', 'dest_site']].drop_duplicates()
+    print(f"   📈 Unique site pairs: {len(unique_pairs)}")
+    
+    # Parse reference date
+    ref_date = datetime.strptime(date_from_str, '%Y-%m-%dT%H:%M:%S.000Z')
+    
+    # Calculate baselines for all pairs efficiently
+    print(f"\n🎯 Calculating baselines for {len(unique_pairs)} pairs efficiently...")
+    baseline_results = get_throughput_baseline_for_pairs(unique_pairs, ref_date, baseline_days)
+    
+    # Add baseline columns to current data
+    print("\n🔗 Adding baselines to current data...")
+    
+    baseline_columns = ['baseline_mean_mbps', 'baseline_median_mbps', 'baseline_std_mbps', 
+                       'baseline_count', 'baseline_quality']
+    
+    # Initialize columns with proper data types
+    current_df['baseline_mean_mbps'] = pd.Series(dtype='float64')
+    current_df['baseline_median_mbps'] = pd.Series(dtype='float64')
+    current_df['baseline_std_mbps'] = pd.Series(dtype='float64')
+    current_df['baseline_count'] = pd.Series(dtype='int64')
+    current_df['baseline_quality'] = pd.Series(dtype='object')
+    
+    # Fill baseline values with proper type conversion
+    for idx, row in current_df.iterrows():
+        pair_key = (row['src_site'], row['dest_site'])
+        if pair_key in baseline_results:
+            baseline = baseline_results[pair_key]
+            for col in baseline_columns:
+                value = baseline.get(col)
+                if col in ['baseline_mean_mbps', 'baseline_median_mbps', 'baseline_std_mbps'] and value is not None:
+                    current_df.at[idx, col] = float(value)
+                elif col == 'baseline_count' and value is not None:
+                    current_df.at[idx, col] = int(value)
+                else:
+                    current_df.at[idx, col] = value
+    
+    # Calculate comparison metrics
+    print("\n📈 Calculating comparison metrics...")
+    
+    # Convert baseline columns to proper numeric types
+    numeric_baseline_cols = ['baseline_mean_mbps', 'baseline_median_mbps', 'baseline_std_mbps']
+    for col in numeric_baseline_cols:
+        current_df[col] = pd.to_numeric(current_df[col], errors='coerce')
+    current_df['baseline_count'] = pd.to_numeric(current_df['baseline_count'], errors='coerce').astype('Int64')
+    
+    # Only for pairs with valid baselines
+    valid_baseline_mask = (current_df['baseline_mean_mbps'].notna()) & (current_df['baseline_mean_mbps'] > 0)
+    
+    # Initialize comparison columns with proper types
+    current_df['vs_baseline_mean_pct'] = pd.Series(dtype='float64')
+    current_df['vs_baseline_median_pct'] = pd.Series(dtype='float64')
+    current_df['vs_baseline_zscore'] = pd.Series(dtype='float64')
+    current_df['is_anomaly'] = False
+    
+    if valid_baseline_mask.any():
+        # Percentage change from baseline mean
+        current_df.loc[valid_baseline_mask, 'vs_baseline_mean_pct'] = (
+            (current_df.loc[valid_baseline_mask, 'value_mbps'] - 
+             current_df.loc[valid_baseline_mask, 'baseline_mean_mbps']) / 
+            current_df.loc[valid_baseline_mask, 'baseline_mean_mbps'] * 100
+        ).round(2)
+        
+        # Percentage change from baseline median  
+        current_df.loc[valid_baseline_mask, 'vs_baseline_median_pct'] = (
+            (current_df.loc[valid_baseline_mask, 'value_mbps'] - 
+             current_df.loc[valid_baseline_mask, 'baseline_median_mbps']) / 
+            current_df.loc[valid_baseline_mask, 'baseline_median_mbps'] * 100
+        ).round(2)
+        
+        # Z-score (only if std > 0)
+        std_mask = valid_baseline_mask & (current_df['baseline_std_mbps'] > 0)
+        if std_mask.any():
+            current_df.loc[std_mask, 'vs_baseline_zscore'] = (
+                (current_df.loc[std_mask, 'value_mbps'] - 
+                 current_df.loc[std_mask, 'baseline_mean_mbps']) / 
+                current_df.loc[std_mask, 'baseline_std_mbps']
+            ).round(2)
+        
+        # Flag anomalies (>50% change from baseline mean for good quality baselines)
+        anomaly_mask = (
+            valid_baseline_mask & 
+            (current_df['vs_baseline_mean_pct'].abs() >= 50) & 
+            (current_df['baseline_quality'].isin(['good', 'fair']))
+        )
+        current_df.loc[anomaly_mask, 'is_anomaly'] = True
+    
+    # Summary
+    print(f"\n✅ Analysis complete:")
+    print(f"   • Total measurements: {len(current_df)}")
+    print(f"   • Pairs with baselines: {valid_baseline_mask.sum()}")
+    print(f"   • Anomalies detected: {current_df['is_anomaly'].sum()}")
+    
+    if valid_baseline_mask.any():
+        quality_summary = current_df[valid_baseline_mask]['baseline_quality'].value_counts()
+        print(f"\n📊 Baseline quality distribution:")
+        for quality, count in quality_summary.items():
+            print(f"   • {quality}: {count} measurements")
+        
+        # Show some anomalies
+        anomalies = current_df[current_df['is_anomaly'] == True]
+        if not anomalies.empty:
+            print(f"\n🚨 Sample anomalies (top 5 by deviation):")
+            sample_anomalies = anomalies.nlargest(5, 'vs_baseline_mean_pct', keep='first')[
+                ['src_site', 'dest_site', 'value_mbps', 'baseline_mean_mbps', 'vs_baseline_mean_pct', 'baseline_quality']
+            ]
+            for _, row in sample_anomalies.iterrows():
+                print(f"   • {row['src_site']} → {row['dest_site']}: {row['value_mbps']:.1f} Mbps vs {row['baseline_mean_mbps']:.1f} Mbps baseline ({row['vs_baseline_mean_pct']:+.1f}%)")
+    
+    return current_df
+
+def test_throughput_baselines(date_from=None, date_to=None, baseline_days=21, max_workers=10):
+    """Test the throughput baseline analysis with timing"""
+    
+    # Use provided dates or default test period
+    if date_from is None:
+        date_from = '2025-08-08T03:00:00.000Z'
+    if date_to is None:
+        date_to = '2025-08-08T06:00:00.000Z'
+    
+    print("="*60)
+    print("TESTING THROUGHPUT BASELINE ANALYSIS")
+    print("="*60)
+    
+    # Test with efficient processing
+    start_time = time.time()
+    throughput_df = get_throughput_with_baselines(date_from, date_to, baseline_days, max_workers)
+    end_time = time.time()
+    
+    print(f"\n✅ Test completed in {end_time - start_time:.2f} seconds")
+    
+    if not throughput_df.empty:
+        print(f"📋 Result: {len(throughput_df)} measurements with baselines")
+        
+        # Show sample results
+        sample_cols = ['src_site', 'dest_site', 'value_mbps', 'baseline_mean_mbps', 
+                      'baseline_quality', 'vs_baseline_mean_pct', 'is_anomaly']
+        available_cols = [col for col in sample_cols if col in throughput_df.columns]
+        sample_df = throughput_df[available_cols].head(10)
+        print(f"\n📊 Sample results:")
+        print(sample_df.to_string(index=False))
+        
+        # Show summary stats
+        if 'baseline_quality' in throughput_df.columns:
+            quality_counts = throughput_df['baseline_quality'].value_counts()
+            print(f"\n🎯 Baseline quality distribution:")
+            for quality, count in quality_counts.items():
+                print(f"   • {quality}: {count}")
+        
+        if 'is_anomaly' in throughput_df.columns:
+            anomaly_count = throughput_df['is_anomaly'].sum()
+            print(f"\n🚨 Anomalies detected: {anomaly_count}")
+        
+    else:
+        print("❌ No data found in test period")
+        
+    return throughput_df
