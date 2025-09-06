@@ -14,35 +14,26 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 
-def align_routing_performance_events(analysis_results, performance_df, time_window_minutes=30):
-    """
-    Align routing anomalies with performance events in time
-    
-    Parameters:
-    -----------
-    analysis_results : DataFrame
-        Output from graph_based_anomaly_detector with routing anomalies
-    performance_df : DataFrame  
-        Performance data with flags (owd_anomaly, loss_anomaly, thr_anomaly)
-    time_window_minutes : int
-        Time window for considering events as co-occurring
-        
-    Returns:
-    --------
-    DataFrame with aligned routing and performance events
-    """
-    print(f"🔗 ALIGNING ROUTING ANOMALIES WITH PERFORMANCE EVENTS")
-    print("=" * 60)
-    
+def align_routing_performance_events(analysis_results, performance_df, time_window_minutes=30): 
     # Filter to routing anomalies only
     routing_anomalies = analysis_results[analysis_results['graph_is_anomaly'] == True].copy()
     
-    # Filter to performance events only
-    perf_events = performance_df[
-        (performance_df.get('owd_anomaly', False) == True) |
-        (performance_df.get('loss_anomaly', False) == True) |  
-        (performance_df.get('thr_anomaly', False) == True)
-    ].copy()
+    # Filter to performance events only - check which flag column exists
+    if 'any_perf_flag' in performance_df.columns:
+        perf_events = performance_df[performance_df['any_perf_flag']==True].copy()
+    elif 'owd_perf_flag' in performance_df.columns or 'loss_perf_flag' in performance_df.columns or 'thr_perf_flag' in performance_df.columns:
+        # Use individual flags if available
+        perf_mask = False
+        if 'owd_perf_flag' in performance_df.columns:
+            perf_mask |= performance_df['owd_perf_flag']
+        if 'loss_perf_flag' in performance_df.columns:
+            perf_mask |= performance_df['loss_perf_flag']
+        if 'thr_perf_flag' in performance_df.columns:
+            perf_mask |= performance_df['thr_perf_flag']
+        perf_events = performance_df[perf_mask].copy()
+    else:
+        # Assume all records are performance events if no flags exist
+        perf_events = performance_df.copy()
     
     print(f"   📊 Data summary:")
     print(f"      • Routing anomalies: {len(routing_anomalies)}")
@@ -84,11 +75,11 @@ def align_routing_performance_events(analysis_results, performance_df, time_wind
                     'performance_time': perf_event['dt'],
                     'time_diff_minutes': time_diff_minutes,
                     'routing_anomaly_score': routing_event['graph_anomaly_score'],
-                    'owd_anomaly': perf_event.get('owd_anomaly', False),
-                    'loss_anomaly': perf_event.get('loss_anomaly', False),
-                    'thr_anomaly': perf_event.get('thr_anomaly', False),
+                    'owd_anomaly': perf_event.get('owd_perf_flag', False),
+                    'loss_anomaly': perf_event.get('loss_perf_flag', False),
+                    'thr_anomaly': perf_event.get('thr_perf_flag', False),
                     'owd_ratio': perf_event.get('owd_ratio', np.nan),
-                    'loss_rate': perf_event.get('loss', np.nan),
+                    'loss_rate': perf_event.get('packet_loss_avg', perf_event.get('packet_loss_pct', np.nan)),
                     'thr_ratio': perf_event.get('thr_ratio', np.nan),
                     'routing_first': routing_time < perf_event['dt']
                 }
@@ -105,7 +96,6 @@ def align_routing_performance_events(analysis_results, performance_df, time_wind
     print(f"      • Routing-first events: {aligned_df['routing_first'].sum()} ({aligned_df['routing_first'].mean()*100:.1f}%)")
     
     return aligned_df
-
 
 def analyze_site_pair_correlation(aligned_events, analysis_results, performance_df):
     """
@@ -135,12 +125,18 @@ def analyze_site_pair_correlation(aligned_events, analysis_results, performance_
         pair_stats[pair]['routing_anomalies'] += 1
         pair_stats[pair]['avg_routing_score'] += event['graph_anomaly_score']
     
-    # Count performance events by pair
-    perf_events = performance_df[
-        (performance_df.get('owd_anomaly', False) == True) |
-        (performance_df.get('loss_anomaly', False) == True) |  
-        (performance_df.get('thr_anomaly', False) == True)
-    ]
+    # Count performance events by pair - use correct flag columns
+    perf_mask = False
+    if 'owd_perf_flag' in performance_df.columns:
+        perf_mask |= performance_df['owd_perf_flag']
+    if 'loss_perf_flag' in performance_df.columns:
+        perf_mask |= performance_df['loss_perf_flag']
+    if 'thr_perf_flag' in performance_df.columns:
+        perf_mask |= performance_df['thr_perf_flag']
+    if 'any_perf_flag' in performance_df.columns:
+        perf_mask |= performance_df['any_perf_flag']
+    
+    perf_events = performance_df[perf_mask] if isinstance(perf_mask, pd.Series) and perf_mask.any() else performance_df
     for _, event in perf_events.iterrows():
         pair = (event['src_site'], event['dest_site'])
         pair_stats[pair]['performance_events'] += 1
@@ -150,11 +146,11 @@ def analyze_site_pair_correlation(aligned_events, analysis_results, performance_
         pair = (event['src_site'], event['dest_site'])
         pair_stats[pair]['aligned_events'] += 1
         
-        if event['owd_anomaly']:
+        if event.get('owd_anomaly', False):
             pair_stats[pair]['performance_types']['owd'] += 1
-        if event['loss_anomaly']:
+        if event.get('loss_anomaly', False):
             pair_stats[pair]['performance_types']['loss'] += 1  
-        if event['thr_anomaly']:
+        if event.get('thr_anomaly', False):
             pair_stats[pair]['performance_types']['throughput'] += 1
     
     # Calculate correlation rates and averages
@@ -237,11 +233,11 @@ def analyze_asn_involvement(aligned_events, analysis_results, cluster_analysis=N
                     asn_involvement[asn]['performance_correlation'] += 1
                     asn_involvement[asn]['site_pairs'].add((event['src_site'], event['dest_site']))
                     
-                    if event['owd_anomaly']:
+                    if event.get('owd_anomaly', False):
                         asn_involvement[asn]['performance_types']['owd'] += 1
-                    if event['loss_anomaly']:
+                    if event.get('loss_anomaly', False):
                         asn_involvement[asn]['performance_types']['loss'] += 1
-                    if event['thr_anomaly']:
+                    if event.get('thr_anomaly', False):
                         asn_involvement[asn]['performance_types']['throughput'] += 1
     
     # Count total routing events per ASN
@@ -317,17 +313,18 @@ def analyze_causality_patterns(aligned_events):
     # Analyze by performance type
     causality_by_type = {}
     for perf_type in ['owd_anomaly', 'loss_anomaly', 'thr_anomaly']:
-        type_events = aligned_events[aligned_events[perf_type] == True]
-        if len(type_events) > 0:
-            routing_leads = (type_events['routing_first'] == True).sum()
-            causality_by_type[perf_type] = {
-                'total_events': len(type_events),
-                'routing_leads': routing_leads,
-                'routing_leads_pct': routing_leads / len(type_events) * 100
-            }
-            
-            perf_name = perf_type.replace('_anomaly', '').upper()
-            print(f"      • {perf_name}: {routing_leads}/{len(type_events)} routing-first ({routing_leads/len(type_events)*100:.1f}%)")
+        if perf_type in aligned_events.columns:
+            type_events = aligned_events[aligned_events[perf_type] == True]
+            if len(type_events) > 0:
+                routing_leads = (type_events['routing_first'] == True).sum()
+                causality_by_type[perf_type] = {
+                    'total_events': len(type_events),
+                    'routing_leads': routing_leads,
+                    'routing_leads_pct': routing_leads / len(type_events) * 100
+                }
+                
+                perf_name = perf_type.replace('_anomaly', '').upper()
+                print(f"      • {perf_name}: {routing_leads}/{len(type_events)} routing-first ({routing_leads/len(type_events)*100:.1f}%)")
     
     return {
         'routing_first_events': routing_first,
