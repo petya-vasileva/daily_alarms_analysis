@@ -7,6 +7,7 @@ import time
 from typing import Dict, List, Optional, Tuple
 import warnings
 from utils.helpers import ConnectES
+from data_queries import query_owd_baseline, query_throughput_baseline, query_trace_baseline
 
 warnings.filterwarnings('ignore')
 
@@ -78,43 +79,9 @@ class BaselineManager:
         if field_type not in ["netsite", "host"]:
             raise ValueError(f"field_type must be 'netsite' or 'host', got '{field_type}'")
         
-        # Set field names based on type
-        src_field = f"src_{field_type}"
-        dest_field = f"dest_{field_type}"
-        
         # Calculate time range
         current_time = datetime.utcnow()
         start_time = current_time - timedelta(days=time_window)
-        
-        # Query for historical traceroute data
-        path_query = {
-            "size": 5000,  # Limit to recent measurements
-            "query": {
-                "bool": {
-                    "must": [
-                        {
-                            "range": {
-                                "timestamp": {
-                                    "gte": start_time.isoformat(),
-                                    "lte": current_time.isoformat()
-                                }
-                            }
-                        },
-                        {"term": {src_field: src}},
-                        {"term": {dest_field: dest}},
-                        {"term": {"ipv6": True}},
-                        {
-                            "exists": {"field": "hops"}
-                        }
-                    ]
-                }
-            },
-            "_source": [
-                "timestamp", "hops", "destination_reached", "path_complete", 
-                "n_hops", "ttls", "max_rtt"
-            ],
-            "sort": [{"timestamp": {"order": "desc"}}]
-        }
         
         cache_key = self._get_cache_key("path_length", {
             "src": src, "dest": dest, "field_type": field_type,
@@ -122,7 +89,14 @@ class BaselineManager:
         })
         
         try:
-            result = self._execute_cached_query("ps_trace*", path_query, cache_key)
+            # Use query from data_queries module  
+            start_time_iso = start_time.strftime('%Y-%m-%dT%H:%M:%S.000Z')
+            end_time_iso = current_time.strftime('%Y-%m-%dT%H:%M:%S.000Z')
+            
+            result = query_trace_baseline(src, dest, start_time_iso, end_time_iso, field_type, "path_length")
+            if cache_key:
+                self.cache[cache_key] = result
+                self.query_count += 1
             
             if result['hits']['total']['value'] == 0:
                 return {
@@ -247,38 +221,8 @@ class BaselineManager:
         if field_type not in ["netsite", "host"]:
             raise ValueError(f"field_type must be 'netsite' or 'host', got '{field_type}'")
         
-        src_field = f"src_{field_type}"
-        dest_field = f"dest_{field_type}"
-        
         current_time = datetime.utcnow()
         start_time = current_time - timedelta(days=time_window)
-        
-        # Query for reachability data
-        reachability_query = {
-            "size": 1000,
-            "query": {
-                "bool": {
-                    "must": [
-                        {
-                            "range": {
-                                "timestamp": {
-                                    "gte": start_time.isoformat(),
-                                    "lte": current_time.isoformat()
-                                }
-                            }
-                        },
-                        {"term": {src_field: src}},
-                        {"term": {dest_field: dest}},
-                        {"term": {"ipv6": True}}
-                    ]
-                }
-            },
-            "_source": [
-                "timestamp", "destination_reached", "path_complete", 
-                "hops", "max_rtt", "n_hops"
-            ],
-            "sort": [{"timestamp": {"order": "desc"}}]
-        }
         
         cache_key = self._get_cache_key("reachability", {
             "src": src, "dest": dest, "field_type": field_type,
@@ -286,7 +230,14 @@ class BaselineManager:
         })
         
         try:
-            result = self._execute_cached_query("ps_trace*", reachability_query, cache_key)
+            # Use query from data_queries module
+            start_time_iso = start_time.strftime('%Y-%m-%dT%H:%M:%S.000Z')
+            end_time_iso = current_time.strftime('%Y-%m-%dT%H:%M:%S.000Z')
+            
+            result = query_trace_baseline(src, dest, start_time_iso, end_time_iso, field_type, "reachability")
+            if cache_key:
+                self.cache[cache_key] = result
+                self.query_count += 1
             
             if result['hits']['total']['value'] == 0:
                 return {
@@ -404,9 +355,7 @@ class BaselineManager:
         
         # Get baseline data
         try:
-            # Use internal queryData function (copied from AAAS ps_throughput.py)
-            
-            baseline_data = self._queryData_throughput(baseline_start_str, baseline_end_str)
+            baseline_data = query_throughput_baseline(baseline_start_str, baseline_end_str)
             baseline_df = pd.DataFrame(baseline_data)
             
             if baseline_df.empty:
@@ -498,10 +447,7 @@ class BaselineManager:
         
         # Get baseline data ONCE for all pairs
         try:
-            # Use internal queryData function (copied from AAAS ps_throughput.py)
-            
-            # print(f"   📊 Querying baseline data: {baseline_start_str} to {baseline_end_str}")
-            baseline_data = self._queryData_throughput(baseline_start_str, baseline_end_str)
+            baseline_data = query_throughput_baseline(baseline_start_str, baseline_end_str)
             baseline_df = pd.DataFrame(baseline_data)
             
             if baseline_df.empty:
@@ -602,13 +548,8 @@ class BaselineManager:
             - owd_stats: comprehensive delay statistics
             - baseline_quality: quality indicator
         """
-        # print(f"⏱️  Calculating expected OWD: {src} → {dest} ({field_type})")
-        
         if field_type not in ["netsite", "host"]:
             raise ValueError(f"field_type must be 'netsite' or 'host', got '{field_type}'")
-        
-        src_field = f"src_{field_type}"
-        dest_field = f"dest_{field_type}"
         
         # Use reference_date if provided, otherwise use current time
         if reference_date is not None:
@@ -618,60 +559,21 @@ class BaselineManager:
         
         start_time = end_time - timedelta(days=time_window)
         
-        # Query for OWD data with aggregations for efficiency
-        owd_query = {
-            "size": 0,  # Only need aggregations
-            "query": {
-                "bool": {
-                    "must": [
-                        {
-                            "range": {
-                                "@timestamp": {
-                                    "gte": start_time.isoformat(),
-                                    "lte": end_time.isoformat()
-                                }
-                            }
-                        },
-                        {"term": {src_field: src}},
-                        {"term": {dest_field: dest}},
-                        {"term": {"ipv6": True}},
-                        {
-                            "range": {
-                                "delay_median": {
-                                    "gt": 0,
-                                    "lt": 10000  # Reasonable delay range
-                                }
-                            }
-                        }
-                    ]
-                }
-            },
-            "aggs": {
-                "delay_stats": {
-                    "stats": {"field": "delay_median"}
-                },
-                "delay_percentiles": {
-                    "percentiles": {
-                        "field": "delay_median",
-                        "percents": [5, 10, 25, 50, 75, 90, 95, 99]
-                    }
-                },
-                "delay_histogram": {
-                    "histogram": {
-                        "field": "delay_median",
-                        "interval": 1.0
-                    }
-                }
-            }
-        }
+        # Convert to ISO format for query
+        start_time_iso = start_time.strftime('%Y-%m-%dT%H:%M:%S.000Z')
+        end_time_iso = end_time.strftime('%Y-%m-%dT%H:%M:%S.000Z')
         
         cache_key = self._get_cache_key("owd", {
             "src": src, "dest": dest, "field_type": field_type,
-            "start_time": start_time.isoformat()
+            "start_time": start_time_iso
         })
         
         try:
-            result = self._execute_cached_query("ps_owd*", owd_query, cache_key)
+            # Use query from data_queries module
+            result = query_owd_baseline(src, dest, start_time_iso, end_time_iso, field_type)
+            if cache_key:
+                self.cache[cache_key] = result
+                self.query_count += 1
             
             if result['aggregations']['delay_stats']['count'] == 0:
                 return {
@@ -718,9 +620,6 @@ class BaselineManager:
             # Method 1: Statistical approach (5th percentile as baseline)
             statistical_baseline = percentiles['5.0']
             
-            # # Method 2: Mode-based approach (most common delay)
-            # mode_baseline = mode_delay
-            
             # Method 3: Minimum with buffer (min + 10% for noise tolerance)
             buffered_min = min_owd * 1.1
 
@@ -737,9 +636,6 @@ class BaselineManager:
                 expected_owd = min_owd
                 baseline_method = 'minimum'
 
-            # We can be more precise with the expected number of measurements
-            # by considering the distribution of existing measurements or 
-            # calculating the ideal measurement count based on the time window
             if owd_stats['count'] >= 100:
                 baseline_quality = 'excellent'
             elif owd_stats['count'] >= 50:
@@ -851,169 +747,6 @@ class BaselineManager:
         
         return df
     
-    # Helper functions copied from AAAS ps_throughput.py script
-    def _query4Avg_throughput(self, dateFrom, dateTo):
-        """
-        Query throughput data with averaging (copied from AAAS ps_throughput.py)
-        """
-        query = {
-            "bool": {
-                "must": [
-                    {
-                        "range": {
-                            "timestamp": {
-                                "gt": dateFrom,
-                                "lte": dateTo
-                            }
-                        }
-                    },
-                    {
-                        "term": {
-                            "src_production": True
-                        }
-                    },
-                    {
-                        "term": {
-                            "dest_production": True
-                        }
-                    }
-                ]
-            }
-        }
-        
-        aggregations = {
-            "groupby": {
-                "composite": {
-                    "size": 9999,
-                    "sources": [
-                        {"ipv6": {"terms": {"field": "ipv6"}}},
-                        {"src": {"terms": {"field": "src"}}},
-                        {"dest": {"terms": {"field": "dest"}}},
-                        {"src_host": {"terms": {"field": "src_host"}}},
-                        {"dest_host": {"terms": {"field": "dest_host"}}},
-                        {"src_site": {"terms": {"field": "src_netsite"}}},
-                        {"dest_site": {"terms": {"field": "dest_netsite"}}}
-                    ]
-                },
-                "aggs": {
-                    "throughput": {
-                        "avg": {
-                            "field": "throughput"
-                        }
-                    }
-                }
-            }
-        }
-        
-        aggrs = []
-        aggdata = self.es.search(index='ps_throughput', query=query, aggregations=aggregations)
-        
-        for item in aggdata['aggregations']['groupby']['buckets']:
-            aggrs.append({
-                'hash': str(item['key']['src'] + '-' + item['key']['dest']),
-                'from': dateFrom, 'to': dateTo,
-                'ipv6': item['key']['ipv6'],
-                'src': item['key']['src'], 'dest': item['key']['dest'],
-                'src_host': item['key']['src_host'], 'dest_host': item['key']['dest_host'],
-                'src_site': item['key']['src_site'], 'dest_site': item['key']['dest_site'],
-                'value': item['throughput']['value'],
-                'doc_count': item['doc_count']
-            })
-        
-        return aggrs
-    
-    def _normalize_to_iso8601(self, date_str):
-        """
-        Ensure date string is in ISO 8601 format (copied from AAAS ps_throughput.py)
-        """
-        if not isinstance(date_str, str):
-            date_str = str(date_str)
-        
-        # Try ISO first
-        try:
-            dt = datetime.strptime(date_str, '%Y-%m-%dT%H:%M:%S.000Z')
-            return dt.strftime('%Y-%m-%dT%H:%M:%S.000Z')
-        except ValueError:
-            pass
-        
-        # Try fallback format
-        try:
-            dt = datetime.strptime(date_str, '%Y-%m-%d %H:%M')
-            return dt.strftime('%Y-%m-%dT%H:%M:%S.000Z')
-        except ValueError:
-            pass
-        
-        # Return as-is if not recognized
-        return date_str
-    
-    def _iso8601_to_ymdhm(self, date_str):
-        """
-        Convert ISO 8601 to '%Y-%m-%d %H:%M' format (copied from AAAS ps_throughput.py)
-        """
-        if not isinstance(date_str, str):
-            date_str = str(date_str)
-        try:
-            dt = datetime.strptime(date_str, '%Y-%m-%dT%H:%M:%S.000Z')
-            return dt.strftime('%Y-%m-%d %H:%M')
-        except ValueError:
-            return date_str
-    
-    def _calc_minutes_4_period(self, dateFrom, dateTo):
-        """
-        Calculate minutes in period (copied from AAAS helpers.py)
-        """
-        fmt = '%Y-%m-%d %H:%M'
-        d1 = datetime.strptime(dateFrom, fmt)
-        d2 = datetime.strptime(dateTo, fmt)
-        time_delta = d2 - d1
-        return (time_delta.days * 24 * 60 + time_delta.seconds // 60)
-    
-    def _get_time_ranges(self, dateFrom, dateTo, intv=1):
-        """
-        Split period into chunks (copied from AAAS helpers.py)
-        """
-        fmt = '%Y-%m-%d %H:%M'
-        d1 = datetime.strptime(dateFrom, fmt)
-        d2 = datetime.strptime(dateTo, fmt)
-        diff = (d2 - d1) / intv
-        
-        t_format = "%Y-%m-%d %H:%M"
-        tl = []
-        for i in range(intv + 1):
-            t = (datetime.strptime(dateFrom, t_format) + diff * i).strftime(t_format)
-            tl.append(t)
-        
-        return tl
-    
-    def _queryData_throughput(self, dateFrom, dateTo):
-        """
-        Query throughput data in chunks (copied from AAAS ps_throughput.py)
-        ES does not allow aggregations with more than 10000 bins
-        """
-        data = []
-        
-        # Normalize dates to ISO 8601 format for ES
-        dateFrom_iso = self._normalize_to_iso8601(dateFrom)
-        dateTo_iso = self._normalize_to_iso8601(dateTo)
-        
-        # Convert to '%Y-%m-%d %H:%M' for helper functions
-        dateFrom_h = self._iso8601_to_ymdhm(dateFrom_iso)
-        dateTo_h = self._iso8601_to_ymdhm(dateTo_iso)
-        
-        # Query in portions
-        intv = int(self._calc_minutes_4_period(dateFrom_h, dateTo_h) / 60)
-        if intv < 1:
-            intv = 1
-            
-        time_list = self._get_time_ranges(dateFrom_h, dateTo_h, intv)
-        
-        for i in range(len(time_list) - 1):
-            # Convert back to ISO for ES queries
-            t_from = self._normalize_to_iso8601(time_list[i])
-            t_to = self._normalize_to_iso8601(time_list[i + 1])
-            data.extend(self._query4Avg_throughput(t_from, t_to))
-        
-        return data
 
 def get_throughput_baseline_for_pairs(unique_pairs, reference_date, baseline_days=21):
     """
@@ -1069,8 +802,7 @@ def get_throughput_with_baselines(date_from_str, date_to_str, baseline_days=21, 
     
     # Get current throughput data
     print("\n📊 Querying current throughput data...")
-    from ps_throughput import queryData
-    current_data = queryData(date_from_str, date_to_str)
+    current_data = query_throughput_baseline(date_from_str, date_to_str)
     current_df = pd.DataFrame(current_data)
     
     if current_df.empty:
@@ -1079,6 +811,7 @@ def get_throughput_with_baselines(date_from_str, date_to_str, baseline_days=21, 
     
     # Process current data
     current_df['dt'] = pd.to_datetime(current_df['from'], unit='ms')
+    current_df['dt_str'] = current_df['dt'].dt.strftime('%Y-%m-%d %H:%M:%S UTC')
     current_df['src_site'] = current_df['src_site'].str.upper()
     current_df['dest_site'] = current_df['dest_site'].str.upper()
     current_df['value_mbps'] = current_df['value'] * 1e-6

@@ -12,7 +12,9 @@ import warnings
 warnings.filterwarnings('ignore')
 
 from baseline_manager import BaselineManager
+from data_queries import query_throughput_raw, query_owd_aggregated, query_packetloss_aggregated, query_traceroute_raw
 import utils.helpers as hp
+from utils.helpers import normalize_timestamp_column
 
 class FocusedDataCollector:
     def __init__(self, date_from_str, date_to_str, focus_pairs, baseline_days=21, include_reverse_pairs=False):
@@ -86,7 +88,7 @@ class FocusedDataCollector:
                 continue
                 
             try:
-                # Case-insensitive search in throughput index first
+                # Case-insensitive search in owd index first
                 query = {
                     "size": 1,
                     "query": {
@@ -184,8 +186,38 @@ class FocusedDataCollector:
         # Process throughput data
         current_df = pd.DataFrame(all_throughput_data)
         
-        # Process current data (same as original function)
-        current_df['dt'] = pd.to_datetime(current_df['from'], unit='ms', utc=True)
+        # Debug: Print column info
+        if not current_df.empty:
+            print(f"   🔍 Throughput data columns: {list(current_df.columns)}")
+            if 'timestamp_ms' in current_df.columns:
+                print(f"   🔍 timestamp_ms sample values: {current_df['timestamp_ms'].head(3).tolist()}")
+                print(f"   🔍 timestamp_ms dtype: {current_df['timestamp_ms'].dtype}")
+        
+        # Handle throughput timestamp columns (can be timestamp_ms or from)
+        if 'timestamp_ms' in current_df.columns and not current_df['timestamp_ms'].isna().all():
+            # Use timestamp_ms as the primary timestamp
+            current_df['timestamp'] = current_df['timestamp_ms']
+            current_df = normalize_timestamp_column(current_df, unit='ms')
+        elif 'from' in current_df.columns:
+            # Use from column as timestamp
+            current_df['timestamp'] = current_df['from'] 
+            current_df = normalize_timestamp_column(current_df, unit='ms')
+        else:
+            print("   ⚠️ Warning: No valid timestamp column found in throughput data")
+            return pd.DataFrame()
+        
+        # Filter out invalid timestamps after normalization
+        valid_timestamp_mask = current_df['timestamp'].notna()
+        invalid_count = (~valid_timestamp_mask).sum()
+        
+        if invalid_count > 0:
+            print(f"   ⚠️ {invalid_count}/{len(current_df)} invalid timestamps found - filtering out")
+            current_df = current_df[valid_timestamp_mask]
+            
+        if current_df.empty:
+            print("   ❌ No valid timestamp data after filtering")
+            return pd.DataFrame()
+        
         current_df['src_site'] = current_df['src_site'].str.upper()
         current_df['dest_site'] = current_df['dest_site'].str.upper()
         current_df['value_mbps'] = current_df['value'] * 1e-6
@@ -244,79 +276,24 @@ class FocusedDataCollector:
         
         print(f"   🚨 Performance flags: {current_df['thr_perf_flag'].sum()} degraded throughput events")
         
+        # Initialize throughput_filled column as boolean
+        current_df['throughput_filled'] = False
+        
         # Throughput filling will be done later after trace data is collected
         # (needed for symmetric path validation)
         
         return current_df
     
     def _query_throughput_for_pair(self, src_site, dest_site):
-        date_from_ms = int(self.date_from_dt.timestamp() * 1000)
-        date_to_ms = int(self.date_to_dt.timestamp() * 1000)
-        
-        query = {
-            "bool": {
-                "must": [
-                    {
-                        "range": {
-                            "timestamp": {
-                                "gt": date_from_ms,
-                                "lte": date_to_ms
-                            }
-                        }
-                    },
-                    {"term": {"src_production": True}},
-                    {"term": {"dest_production": True}},
-                    {"term": {"ipv6": True}},
-                    {"term": {"src_netsite": src_site}},
-                    {"term": {"dest_netsite": dest_site}}
-                ]
-            }
-        }
-        
-        aggregations = {
-            "groupby": {
-                "composite": {
-                    "size": 9999,
-                    "sources": [
-                        {"ipv6": {"terms": {"field": "ipv6"}}},
-                        {"src": {"terms": {"field": "src"}}},
-                        {"dest": {"terms": {"field": "dest"}}},
-                        {"src_host": {"terms": {"field": "src_host"}}},
-                        {"dest_host": {"terms": {"field": "dest_host"}}},
-                        {"src_site": {"terms": {"field": "src_netsite"}}},
-                        {"dest_site": {"terms": {"field": "dest_netsite"}}}
-                    ]
-                },
-                "aggs": {
-                    "throughput": {
-                        "avg": {"field": "throughput"}
-                    }
-                }
-            }
-        }
-        
+        """Query raw throughput data for a site pair (no aggregations to preserve sparse data)"""
         try:
-            aggdata = hp.es.search(index='ps_throughput', query=query, aggregations=aggregations)
-            
-            aggrs = []
-            if 'aggregations' in aggdata and 'groupby' in aggdata['aggregations']:
-                for item in aggdata['aggregations']['groupby']['buckets']:
-                    aggrs.append({
-                        'hash': str(item['key']['src'] + '-' + item['key']['dest']),
-                        'from': date_from_ms, 
-                        'to': date_to_ms,
-                        'ipv6': item['key']['ipv6'],
-                        'src': item['key']['src'], 
-                        'dest': item['key']['dest'],
-                        'src_host': item['key']['src_host'], 
-                        'dest_host': item['key']['dest_host'],
-                        'src_site': item['key']['src_site'], 
-                        'dest_site': item['key']['dest_site'],
-                        'value': item['throughput']['value'],
-                        'doc_count': item['doc_count']
-                    })
-            
-            return aggrs
+            # Use raw throughput query from data_queries module
+            return query_throughput_raw(
+                src_site=src_site,
+                dest_site=dest_site, 
+                date_from_iso=self.date_from,
+                date_to_iso=self.date_to
+            )
             
         except Exception as e:
             print(f"         ❌ ES query failed: {e}")
@@ -354,7 +331,7 @@ class FocusedDataCollector:
                         (throughput_df['src_site'] == src) & 
                         (throughput_df['dest_site'] == dest)
                     ].copy()
-                    
+
                     if not forward_data.empty:
                         # Create reverse direction entries
                         reverse_data = forward_data.copy()
@@ -387,10 +364,12 @@ class FocusedDataCollector:
                     # Paths are not symmetric - skip filling
                     asymmetric_skipped += 1
         
-        # Add throughput_filled flag to original data
+        # Ensure throughput_filled column is boolean (should already exist from collect_throughput_data_focused)
         if 'throughput_filled' not in throughput_df.columns:
             throughput_df['throughput_filled'] = False
-            throughput_df.loc[throughput_df.index < original_count, 'throughput_filled'] = False
+        
+        # Ensure it's properly boolean type without NaN values
+        throughput_df['throughput_filled'] = throughput_df['throughput_filled'].fillna(False).astype('bool')
         
         print(f"      📊 Path symmetry validation:")
         print(f"         • Symmetric pairs (filled): {symmetric_validated}")
@@ -496,97 +475,20 @@ class FocusedDataCollector:
         """
         print(f"\n⏱️ Collecting OWD data for focus pairs (aggregated to {aggregate_minutes}min intervals)...")
         
-        # Convert dates to milliseconds for ES query
-        date_from_ms = int(self.date_from_dt.timestamp() * 1000)
-        date_to_ms = int(self.date_to_dt.timestamp() * 1000)
-        
         all_owd_records = []
         
         # Query each focus pair individually to limit data at source (using database site names)
         for src_site, dest_site in self.db_focus_pairs:
-            # print(f"   📡 Querying {src_site} → {dest_site}...")
-            
-            query = {
-                "size": 0,
-                "query": {
-                    "bool": {
-                        "must": [
-                            {
-                                "range": {
-                                    "timestamp": {
-                                        "gt": date_from_ms,
-                                        "lte": date_to_ms
-                                    }
-                                }
-                            },
-                            {"term": {"src_production": True}},
-                            {"term": {"dest_production": True}},
-                            {"term": {"ipv6": True}},
-                            {"term": {"src_netsite": src_site}},
-                            {"term": {"dest_netsite": dest_site}}
-                        ]
-                    }
-                },
-                "aggs": {
-                    "time_series": {
-                        "date_histogram": {
-                            "field": "timestamp",
-                            "fixed_interval": f"{aggregate_minutes}m",
-                            "time_zone": "UTC"
-                        },
-                        "aggs": {
-                            "ipv_breakdown": {
-                                "terms": {
-                                    "field": "ipv6"
-                                },
-                                "aggs": {
-                                    "delay_stats": {
-                                        "stats": {"field": "delay_median"}
-                                    },
-                                    "delay_percentiles": {
-                                        "percentiles": {
-                                            "field": "delay_median",
-                                            "percents": [50, 75, 90, 95, 99]
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            
             try:
-                result = hp.es.search(index='ps_owd', body=query)
-                
-                if 'aggregations' in result and 'time_series' in result['aggregations']:
-                    time_buckets = result['aggregations']['time_series']['buckets']
-                    
-                    for time_bucket in time_buckets:
-                        timestamp = time_bucket['key_as_string']
-                        ipv_buckets = time_bucket['ipv_breakdown']['buckets']
-                        
-                        for ipv_bucket in ipv_buckets:
-                            ipv6 = ipv_bucket['key']
-                            stats = ipv_bucket['delay_stats']
-                            percentiles = ipv_bucket['delay_percentiles']['values']
-                            
-                            if stats['count'] > 0:
-                                all_owd_records.append({
-                                    'timestamp': timestamp,
-                                    'src_site': src_site.upper(),
-                                    'dest_site': dest_site.upper(),
-                                    'ipv6': ipv6,
-                                    'doc_count': stats['count'],
-                                    'delay_mean': stats['avg'],
-                                    'delay_median': percentiles.get('50.0'),
-                                    'delay_p75': percentiles.get('75.0'),
-                                    'delay_p90': percentiles.get('90.0'),
-                                    'delay_p95': percentiles.get('95.0'),
-                                    'delay_p99': percentiles.get('99.0'),
-                                    'delay_min': stats['min'],
-                                    'delay_max': stats['max']
-                                })
+                # Use OWD query from data_queries module
+                owd_data = query_owd_aggregated(
+                    src_site=src_site,
+                    dest_site=dest_site,
+                    date_from_iso=self.date_from,
+                    date_to_iso=self.date_to,
+                    aggregate_minutes=aggregate_minutes
+                )
+                all_owd_records.extend(owd_data)
                 
             except Exception as e:
                 print(f"      ❌ Error querying {src_site} → {dest_site}: {e}")
@@ -597,7 +499,8 @@ class FocusedDataCollector:
             return pd.DataFrame()
         
         owd_df = pd.DataFrame(all_owd_records)
-        owd_df['dt'] = pd.to_datetime(owd_df['timestamp'], utc=True)
+        # Normalize timestamp columns using utility function
+        owd_df = normalize_timestamp_column(owd_df, unit='s')
         
         print(f"   ✅ Collected {len(owd_df)} OWD measurements for focus pairs")
         
@@ -658,83 +561,20 @@ class FocusedDataCollector:
     def collect_packetloss_data_focused(self, aggregate_minutes=10):
         print(f"\n📦 Collecting packet loss data for focus pairs (aggregated to {aggregate_minutes}min intervals)...")
         
-        date_from_ms = int(self.date_from_dt.timestamp() * 1000)
-        date_to_ms = int(self.date_to_dt.timestamp() * 1000)
-        
         all_loss_records = []
         
         # Query each focus pair individually (using database site names)
         for src_site, dest_site in self.db_focus_pairs:
-            query = {
-                "size": 0,
-                "query": {
-                    "bool": {
-                        "must": [
-                            {
-                                "range": {
-                                    "timestamp": {
-                                        "gt": date_from_ms,
-                                        "lte": date_to_ms,
-                                        "format": "epoch_millis"
-                                    }
-                                }
-                            },
-                            {"term": {"src_production": True}},
-                            {"term": {"dest_production": True}},
-                            {"term": {"ipv6": True}},
-                            {"term": {"src_netsite": src_site}},
-                            {"term": {"dest_netsite": dest_site}}
-                        ]
-                    }
-                },
-                "aggs": {
-                    "time_series": {
-                        "date_histogram": {
-                            "field": "timestamp",
-                            "fixed_interval": f"{aggregate_minutes}m",
-                            "time_zone": "UTC"
-                        },
-                        "aggs": {
-                            "ipv_breakdown": {
-                                "terms": {
-                                    "field": "ipv6"
-                                },
-                                "aggs": {
-                                    "packet_loss_stats": {
-                                        "stats": {"field": "packet_loss"}
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            
             try:
-                result = hp.es.search(index='ps_packetloss', body=query)
-                
-                if 'aggregations' in result and 'time_series' in result['aggregations']:
-                    time_buckets = result['aggregations']['time_series']['buckets']
-                    
-                    for time_bucket in time_buckets:
-                        timestamp = time_bucket['key_as_string']
-                        ipv_buckets = time_bucket['ipv_breakdown']['buckets']
-                        
-                        for ipv_bucket in ipv_buckets:
-                            ipv6 = ipv_bucket['key']
-                            stats = ipv_bucket['packet_loss_stats']
-                            
-                            if stats['count'] > 0:
-                                all_loss_records.append({
-                                    'timestamp': timestamp,
-                                    'src_site': src_site.upper(),
-                                    'dest_site': dest_site.upper(),
-                                    'ipv6': ipv6,
-                                    'doc_count': stats['count'],
-                                    'packet_loss_avg': stats['avg'],
-                                    'packet_loss_min': stats['min'],
-                                    'packet_loss_max': stats['max']
-                                })
+                # Use packet loss query from data_queries module
+                loss_data = query_packetloss_aggregated(
+                    src_site=src_site,
+                    dest_site=dest_site,
+                    date_from_iso=self.date_from,
+                    date_to_iso=self.date_to,
+                    aggregate_minutes=aggregate_minutes
+                )
+                all_loss_records.extend(loss_data)
                 
             except Exception as e:
                 print(f"      ❌ Error querying packet loss for {src_site} → {dest_site}: {e}")
@@ -745,7 +585,8 @@ class FocusedDataCollector:
             return pd.DataFrame()
         
         loss_df = pd.DataFrame(all_loss_records)
-        loss_df['dt'] = pd.to_datetime(loss_df['timestamp'], utc=True)
+        # Normalize timestamp columns using utility function
+        loss_df = normalize_timestamp_column(loss_df, unit='s')
         
         # Convert to percentage and add performance flags
         loss_df['packet_loss_pct'] = loss_df['packet_loss_avg'] * 100
@@ -759,51 +600,19 @@ class FocusedDataCollector:
     def collect_traceroute_data_focused(self):
         print(f"\n🛤️ Collecting traceroute data for focus pairs...")
         
-        # Convert dates to ISO format for ES query
-        date_from_iso = self.date_from_dt.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
-        date_to_iso = self.date_to_dt.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
-        
         all_traces = []
         
         # Query each focus pair individually to limit data (using database site names)
         for src_site, dest_site in self.db_focus_pairs:
-            query = {
-                "size": 10000,  # Reduced limit per pair
-                "query": {
-                    "bool": {
-                        "must": [
-                            {
-                                "range": {
-                                    "timestamp": {
-                                        "gt": date_from_iso,
-                                        "lte": date_to_iso,
-                                        "format": "strict_date_optional_time"
-                                    }
-                                }
-                            },
-                            {"term": {"src_production": True}},
-                            {"term": {"dest_production": True}},
-                            {"term": {"ipv6": True}},
-                            {"term": {"src_netsite": src_site}},
-                            {"term": {"dest_netsite": dest_site}}
-                        ]
-                    }
-                },
-                "_source": [
-                    "timestamp", "created_at", "src_netsite", "dest_netsite", "ipv6",
-                    "src_host", "dest_host", "src", "dest", 
-                    "hops", "asns", "ttls", "rtts",
-                    "destination_reached", "path_complete", "route-sha1"
-                ],
-                "sort": [{"timestamp": {"order": "desc"}}]
-            }
-            
             try:
-                result = hp.es.search(index='ps_trace', body=query)
-                traces_for_pair = result['hits']['hits']
+                # Use traceroute query from data_queries module
+                traces_for_pair = query_traceroute_raw(
+                    src_site=src_site,
+                    dest_site=dest_site,
+                    date_from_iso=self.date_from,
+                    date_to_iso=self.date_to
+                )
                 all_traces.extend(traces_for_pair)
-                
-                # print(f"      • {src_site} → {dest_site}: {len(traces_for_pair)} traces")
                 
             except Exception as e:
                 print(f"      ❌ Error querying traces for {src_site} → {dest_site}: {e}")
@@ -858,7 +667,8 @@ class FocusedDataCollector:
             })
         
         trace_df = pd.DataFrame(trace_records)
-        trace_df['dt'] = pd.to_datetime(trace_df['timestamp'], utc=True)
+        # Normalize timestamp columns using utility function (traceroute typically uses string timestamps)
+        trace_df = normalize_timestamp_column(trace_df, unit='s')
         
         print(f"   ✅ Collected {len(trace_df)} traceroute measurements for focus pairs")
         print(f"      • Unique paths (route SHA1): {trace_df['route_sha1'].nunique()}")
@@ -949,54 +759,70 @@ class FocusedDataCollector:
             if combined_df.empty:
                 combined_df = loss_df.copy()
             else:
-                # Merge on timestamp and pair
+                # Merge on timestamp and pair - use common columns
+                merge_cols = ['src_site', 'dest_site', 'ipv6', 'dt']
+                # Only include timestamp if both dataframes have it
+                if 'timestamp' in combined_df.columns and 'timestamp' in loss_df.columns:
+                    merge_cols.append('timestamp')
+                
                 combined_df = pd.merge(
                     combined_df, 
                     loss_df, 
-                    on=['timestamp', 'src_site', 'dest_site', 'ipv6', 'dt'], 
+                    on=merge_cols, 
                     how='outer',
                     suffixes=('', '_loss')
                 )
         
-        # Add throughput data (lower frequency, wider time window)
-        if not throughput_df.empty and not combined_df.empty:
-            # For each combined record, find closest throughput measurement
-            for idx, row in combined_df.iterrows():
-                # Find throughput data for this pair within 1 hour
-                # Ensure both timestamps are timezone-aware
-                row_dt = row['dt']
-                if row_dt.tz is None:
-                    row_dt = pd.to_datetime(row_dt, utc=True)
+        # Add throughput data (sparse, 1-2 times per day) - reverse logic
+        if not throughput_df.empty:
+            print(f"      📊 Adding {len(throughput_df)} throughput measurements to performance dataset...")
+            
+            # For each throughput measurement, create or enhance a performance record
+            for _, thr_row in throughput_df.iterrows():
+                thr_dt = thr_row['dt']
                 
-                thr_match = throughput_df[
-                    (throughput_df['src_site'] == row['src_site']) &
-                    (throughput_df['dest_site'] == row['dest_site']) &
-                    (throughput_df['ipv6'] == row['ipv6'])
+                # Skip invalid datetime entries
+                if pd.isna(thr_dt):
+                    print(f"      ⚠️ Skipping throughput record with invalid datetime: {thr_row.get('timestamp_ms', 'N/A')}")
+                    continue
+                
+                if thr_dt.tz is None:
+                    thr_dt = pd.to_datetime(thr_dt, utc=True)
+                
+                # Look for existing combined record for this site pair and timestamp
+                existing_match = combined_df[
+                    (combined_df['src_site'] == thr_row['src_site']) &
+                    (combined_df['dest_site'] == thr_row['dest_site']) &
+                    (combined_df['ipv6'] == thr_row['ipv6'])
                 ]
                 
-                if not thr_match.empty:
-                    # Calculate time differences manually to avoid timezone issues
+                if not existing_match.empty:
+                    # Find the closest existing record by time
                     time_diffs = []
-                    for _, thr_row in thr_match.iterrows():
-                        thr_dt = thr_row['dt']
-                        if thr_dt.tz is None:
-                            thr_dt = pd.to_datetime(thr_dt, utc=True)
-                        time_diff = abs((thr_dt - row_dt).total_seconds())
+                    for _, existing_row in existing_match.iterrows():
+                        existing_dt = existing_row['dt']
+                        if existing_dt.tz is None:
+                            existing_dt = pd.to_datetime(existing_dt, utc=True)
+                        time_diff = abs((existing_dt - thr_dt).total_seconds())
                         time_diffs.append(time_diff)
                     
-                    # Filter to within 1 hour
-                    valid_indices = [i for i, diff in enumerate(time_diffs) if diff <= 3600]
-                    if valid_indices:
-                        thr_match = thr_match.iloc[valid_indices]
+                    # Find closest record within 6 hours (throughput is very sparse)
+                    min_diff = min(time_diffs)
+                    if min_diff <= 6 * 3600:  # 6 hours window
+                        closest_idx = existing_match.iloc[time_diffs.index(min_diff)].name
+                        
+                        # Add throughput data to existing record
+                        combined_df.at[closest_idx, 'throughput_mbps'] = thr_row['value_mbps']
+                        combined_df.at[closest_idx, 'baseline_median_throughput'] = thr_row.get('baseline_median_mbps')
+                        combined_df.at[closest_idx, 'thr_ratio'] = thr_row.get('thr_ratio')
+                        combined_df.at[closest_idx, 'thr_perf_flag'] = thr_row.get('thr_perf_flag', False)
+                        combined_df.at[closest_idx, 'throughput_filled'] = thr_row.get('throughput_filled', False)
                     else:
-                        thr_match = pd.DataFrame()  # Empty if no matches within time window
-                
-                if not thr_match.empty:
-                    closest_thr = thr_match.iloc[0]
-                    combined_df.at[idx, 'throughput_mbps'] = closest_thr['value_mbps']
-                    combined_df.at[idx, 'baseline_median_throughput'] = closest_thr['baseline_median_mbps']
-                    combined_df.at[idx, 'thr_ratio'] = closest_thr['thr_ratio']
-                    combined_df.at[idx, 'thr_perf_flag'] = closest_thr['thr_perf_flag']
+                        # No close match - create new performance record centered on throughput
+                        combined_df = self._add_throughput_only_record(combined_df, thr_row, owd_df, loss_df)
+                else:
+                    # No existing record for this pair - create new one
+                    combined_df = self._add_throughput_only_record(combined_df, thr_row, owd_df, loss_df)
         
         if combined_df.empty:
             print("      ⚠️ No data could be combined")
@@ -1009,10 +835,109 @@ class FocusedDataCollector:
             combined_df.get('thr_perf_flag', False)
         )
         
+        # Ensure timestamp column has consistent data types for Parquet compatibility
+        if 'timestamp' in combined_df.columns:
+            combined_df = normalize_timestamp_column(combined_df, unit='s')
+        
         print(f"      ✅ Created unified dataset: {len(combined_df)} records")
         print(f"         • Performance events: {combined_df['any_perf_flag'].sum()}")
         
         return combined_df
+
+    def _add_throughput_only_record(self, combined_df, thr_row, owd_df, loss_df):
+        """Add a new performance record centered on a throughput measurement"""
+        thr_dt = thr_row['dt']
+        
+        # Handle NaT or invalid datetime
+        if pd.isna(thr_dt):
+            print(f"      ⚠️ Invalid datetime for throughput record: {thr_row.get('timestamp_ms', 'N/A')}")
+            return combined_df
+        
+        if thr_dt.tz is None:
+            thr_dt = pd.to_datetime(thr_dt, utc=True)
+        
+        # Get timestamp from throughput row (already normalized)
+        timestamp_value = thr_row.get('timestamp')
+        
+        new_record = {
+            'dt': thr_dt,
+            'dt_str': thr_dt.strftime('%Y-%m-%d %H:%M:%S UTC'),
+            'timestamp': timestamp_value,
+            'src_site': thr_row['src_site'],
+            'dest_site': thr_row['dest_site'],
+            'ipv6': thr_row['ipv6'],
+            'throughput_mbps': thr_row['value_mbps'],
+            'baseline_median_throughput': thr_row.get('baseline_median_mbps'),
+            'thr_ratio': thr_row.get('thr_ratio'),
+            'thr_perf_flag': thr_row.get('thr_perf_flag', False),
+            'throughput_filled': thr_row.get('throughput_filled', False)
+        }
+        
+        # Try to find closest OWD data (within 3 hours of throughput test)
+        if not owd_df.empty:
+            owd_match = owd_df[
+                (owd_df['src_site'] == thr_row['src_site']) &
+                (owd_df['dest_site'] == thr_row['dest_site']) &
+                (owd_df['ipv6'] == thr_row['ipv6'])
+            ]
+            
+            if not owd_match.empty:
+                # Find closest OWD measurement
+                time_diffs = []
+                for _, owd_row in owd_match.iterrows():
+                    owd_dt = owd_row['dt']
+                    if owd_dt.tz is None:
+                        owd_dt = pd.to_datetime(owd_dt, utc=True)
+                    time_diff = abs((owd_dt - thr_dt).total_seconds())
+                    time_diffs.append(time_diff)
+                
+                min_diff = min(time_diffs)
+                if min_diff <= 1 * 3600:  # 3 hour window
+                    closest_owd = owd_match.iloc[time_diffs.index(min_diff)]
+                    new_record.update({
+                        'delay_p95': closest_owd.get('delay_p95'),
+                        'delay_median': closest_owd.get('delay_median'),
+                        'baseline_min_owd': closest_owd.get('baseline_min_owd'),
+                        'baseline_p95_owd': closest_owd.get('baseline_p95_owd'),
+                        'owd_ratio': closest_owd.get('owd_ratio'),
+                        'z_mad_owd': closest_owd.get('z_mad_owd'),
+                        'owd_perf_flag': closest_owd.get('owd_perf_flag', False)
+                    })
+        
+        # Try to find closest packet loss data (within 3 hours of throughput test)
+        if not loss_df.empty:
+            loss_match = loss_df[
+                (loss_df['src_site'] == thr_row['src_site']) &
+                (loss_df['dest_site'] == thr_row['dest_site']) &
+                (loss_df['ipv6'] == thr_row['ipv6'])
+            ]
+            
+            if not loss_match.empty:
+                # Find closest loss measurement
+                time_diffs = []
+                for _, loss_row in loss_match.iterrows():
+                    loss_dt = loss_row['dt']
+                    if loss_dt.tz is None:
+                        loss_dt = pd.to_datetime(loss_dt, utc=True)
+                    time_diff = abs((loss_dt - thr_dt).total_seconds())
+                    time_diffs.append(time_diff)
+                
+                min_diff = min(time_diffs)
+                if min_diff <= 3 * 3600:  # 3 hour window
+                    closest_loss = loss_match.iloc[time_diffs.index(min_diff)]
+                    new_record.update({
+                        'packet_loss_avg': closest_loss.get('packet_loss_avg'),
+                        'packet_loss_pct': closest_loss.get('packet_loss_pct'),
+                        'loss_perf_flag': closest_loss.get('loss_perf_flag', False)
+                    })
+        
+        # Add the new record to combined_df (modify in place)
+        new_df = pd.DataFrame([new_record])
+        # Append to the original dataframe using pd.concat and update the original reference
+        combined_df.reset_index(drop=True, inplace=True)
+        new_combined = pd.concat([combined_df, new_df], ignore_index=True)
+        
+        return new_combined
 
 
 def main_from_cooccurrence_windows(cooccurrence_windows_df, date_from, date_to, include_reverse_pairs=False):

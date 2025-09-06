@@ -165,3 +165,130 @@ def split_time_period(start_str, end_str, bin_hours=12):
         current_start_time = current_end_time
 
     return bins
+
+
+def normalize_timestamp_column(df, timestamp_col='timestamp', datetime_col='dt', dt_str_col='dt_str', unit='s'):
+    """
+    Normalize timestamp column to consistent format for Parquet compatibility
+    
+    Parameters:
+    -----------
+    df : pandas.DataFrame
+        DataFrame with timestamp data
+    timestamp_col : str
+        Name of the timestamp column to normalize (default: 'timestamp')
+    datetime_col : str  
+        Name of the datetime column to create (default: 'dt')
+    dt_str_col : str
+        Name of the human-readable datetime string column (default: 'dt_str')
+    unit : str
+        Unit for timestamp conversion ('s' for seconds, 'ms' for milliseconds)
+    
+    Returns:
+    --------
+    pandas.DataFrame
+        DataFrame with normalized timestamp columns
+    """
+    if df.empty:
+        return df
+    
+    df = df.copy()
+    
+    # Normalize timestamp column to Int64 for Parquet compatibility
+    if timestamp_col in df.columns:
+        # Handle various timestamp formats
+        def normalize_timestamp_value(ts):
+            if pd.isna(ts) or ts is None:
+                return pd.NA
+            
+            if isinstance(ts, str):
+                try:
+                    # Try parsing ISO string first
+                    dt = pd.to_datetime(ts, utc=True)
+                    if unit == 'ms':
+                        return int(dt.timestamp() * 1000)
+                    else:
+                        return int(dt.timestamp())
+                except:
+                    # Try to parse as numeric string
+                    try:
+                        return int(float(ts))
+                    except:
+                        return pd.NA
+            
+            # Convert to numeric and return
+            numeric_ts = pd.to_numeric(ts, errors='coerce')
+            if pd.isna(numeric_ts):
+                return pd.NA
+            return int(numeric_ts)
+        
+        df[timestamp_col] = df[timestamp_col].apply(normalize_timestamp_value)
+        df[timestamp_col] = df[timestamp_col].astype('Int64')
+    
+    # Create datetime column from normalized timestamps
+    df[datetime_col] = pd.NaT
+    
+    valid_mask = df[timestamp_col].notna()
+    if valid_mask.any():
+        try:
+            df.loc[valid_mask, datetime_col] = pd.to_datetime(
+                df.loc[valid_mask, timestamp_col], 
+                unit=unit, 
+                utc=True
+            )
+            # Ensure datetime column is properly typed
+            df[datetime_col] = pd.to_datetime(df[datetime_col], utc=True)
+        except Exception as e:
+            print(f"Warning: Could not convert timestamps to datetime: {e}")
+            print(f"Sample timestamp values: {df.loc[valid_mask, timestamp_col].head(3).tolist()}")
+            print(f"Timestamp column dtype: {df[timestamp_col].dtype}")
+            # Create properly typed empty datetime column
+            df[datetime_col] = pd.to_datetime(pd.Series([pd.NaT] * len(df), dtype='datetime64[ns, UTC]'))
+    
+    # Create human-readable datetime string using safe function
+    df[dt_str_col] = safe_datetime_to_string(df[datetime_col])
+    
+    return df
+
+
+def safe_datetime_to_string(dt_series, format_str='%Y-%m-%d %H:%M:%S UTC'):
+    """
+    Safely convert datetime series to string, handling NaT values
+    
+    Parameters:
+    -----------
+    dt_series : pandas.Series
+        Series with datetime values (may contain NaT)
+    format_str : str
+        Format string for datetime conversion
+    
+    Returns:
+    --------
+    pandas.Series
+        Series with formatted datetime strings (None for NaT values)
+    """
+    if dt_series is None or dt_series.empty:
+        return pd.Series([None] * len(dt_series), index=dt_series.index) if not dt_series.empty else pd.Series()
+    
+    result = pd.Series([None] * len(dt_series), index=dt_series.index, dtype='object')
+    
+    # Check if series has datetime-like values
+    try:
+        valid_mask = dt_series.notna()
+        if valid_mask.any():
+            # Ensure we have a proper datetime series
+            dt_subset = dt_series.loc[valid_mask]
+            if hasattr(dt_subset, 'dt'):
+                result.loc[valid_mask] = dt_subset.dt.strftime(format_str)
+            else:
+                # Try to convert to datetime first
+                dt_converted = pd.to_datetime(dt_subset, errors='coerce')
+                valid_converted = dt_converted.notna()
+                if valid_converted.any():
+                    result.loc[valid_mask[valid_converted]] = dt_converted.loc[valid_converted].dt.strftime(format_str)
+    except Exception as e:
+        print(f"Warning: Could not format datetime strings: {e}")
+        # Return series with None values
+        pass
+    
+    return result
