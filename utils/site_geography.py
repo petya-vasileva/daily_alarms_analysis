@@ -626,33 +626,3 @@ def get_country_summary(df):
     }
     
     return summary
-
-# Example usage functions
-def demo_usage():
-    """Demonstrate how to use the geography functions"""
-    
-    # Create sample data
-    sample_data = {
-        'src_site': ['CERN-PROD', 'BNL-ATLAS', 'IN2P3-CC', 'INFN-T1'],
-        'dest_site': ['BNL-ATLAS', 'CERN-PROD', 'INFN-T1', 'IN2P3-CC'],
-        'value': [100, 200, 150, 80]
-    }
-    
-    df = pd.DataFrame(sample_data)
-    print("📋 Original DataFrame:")
-    print(df)
-    
-    # Add geography
-    df_with_geo = add_geography_to_dataframe(df)
-    print("\n🌍 DataFrame with geography:")
-    print(df_with_geo[['src_site', 'dest_site', 'src_country', 'dest_country', 'is_international']])
-    
-    # Get summary
-    summary = get_country_summary(df_with_geo)
-    print(f"\n📊 Geography Summary:")
-    print(f"   • Total connections: {summary['total_connections']}")
-    print(f"   • International: {summary['international_connections']} ({summary['international_percentage']:.1f}%)")
-    print(f"   • Unique countries: {summary['unique_countries']}")
-
-if __name__ == "__main__":
-    demo_usage()
